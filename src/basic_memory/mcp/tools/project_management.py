@@ -61,11 +61,133 @@ async def list_memory_projects(context: Context | None = None) -> str:
         for project in project_list.projects:
             result += f"• {project.name}\n"
 
-        result += "\n" + "─" * 40 + "\n"
-        result += "Next: Ask which project to use for this session.\n"
-        result += "Example: 'Which project should I use for this task?'\n\n"
-        result += "Session reminder: Track the selected project for all subsequent operations in this conversation.\n"
-        result += "The user can say 'switch to [project]' to change projects."
+    return add_project_metadata(result, current)
+
+
+@mcp.tool()
+async def switch_project(project_name: str, ctx: Context | None = None) -> str:
+    """Switch to a different project context.
+
+    Changes the active project context for all subsequent tool calls.
+    Shows a project summary after switching successfully.
+
+    Args:
+        project_name: Name of the project to switch to
+
+    Returns:
+        Confirmation message with project summary
+
+    Example:
+        switch_project("work-notes")
+        switch_project("personal-journal")
+    """
+    if ctx:  # pragma: no cover
+        await ctx.info(f"Switching to project: {project_name}")
+
+    current_project = session.get_current_project()
+    try:
+        # Validate project exists by getting project list
+        response = await call_get(client, "/projects/projects")
+        project_list = ProjectList.model_validate(response.json())
+
+        # Check if project exists (case-insensitive)
+        matching_project = None
+        for p in project_list.projects:
+            if p.name.lower() == project_name.lower():
+                matching_project = p
+                break
+        
+        if not matching_project:
+            available_projects = [p.name for p in project_list.projects]
+            return f"Error: Project '{project_name}' not found. Available projects: {', '.join(available_projects)}"
+        
+        # Use the actual project name from the list (correct case)
+        actual_project_name = matching_project.name
+
+        # Switch to the project
+        session.set_current_project(actual_project_name)
+        current_project = session.get_current_project()
+        project_config = get_project_config(current_project)
+
+        # Get project info to show summary
+        try:
+            response = await call_get(
+                client,
+                f"{project_config.project_url}/project/info",
+                params={"project_name": actual_project_name},
+            )
+            project_info = ProjectInfoResponse.model_validate(response.json())
+
+            result = f"✓ Switched to {actual_project_name} project\n\n"
+            result += "Project Summary:\n"
+            result += f"• {project_info.statistics.total_entities} entities\n"
+            result += f"• {project_info.statistics.total_observations} observations\n"
+            result += f"• {project_info.statistics.total_relations} relations\n"
+
+        except Exception as e:
+            # If we can't get project info, still confirm the switch
+            logger.warning(f"Could not get project info for {actual_project_name}: {e}")
+            result = f"✓ Switched to {actual_project_name} project\n\n"
+            result += "Project summary unavailable.\n"
+
+        return add_project_metadata(result, actual_project_name)
+
+    except Exception as e:
+        logger.error(f"Error switching to project {project_name}: {e}")
+        # Revert to previous project on error
+        session.set_current_project(current_project)
+
+        # Return user-friendly error message instead of raising exception
+        return dedent(f"""
+            # Project Switch Failed
+
+            Could not switch to project '{project_name}': {str(e)}
+
+            ## Current project: {current_project}
+            Your session remains on the previous project.
+
+            ## Troubleshooting:
+            1. **Check available projects**: Use `list_projects()` to see valid project names
+            2. **Verify spelling**: Ensure the project name is spelled correctly
+            3. **Check permissions**: Verify you have access to the requested project
+            4. **Try again**: The error might be temporary
+
+            ## Available options:
+            - See all projects: `list_projects()`
+            - Stay on current project: `get_current_project()`
+            - Try different project: `switch_project("correct-project-name")`
+
+            If the project should exist but isn't listed, send a message to support@basicmachines.co.
+            """).strip()
+
+
+@mcp.tool()
+async def get_current_project(ctx: Context | None = None) -> str:
+    """Show the currently active project and basic stats.
+
+    Displays which project is currently active and provides basic information
+    about it.
+
+    Returns:
+        Current project name and basic statistics
+
+    Example:
+        get_current_project()
+    """
+    if ctx:  # pragma: no cover
+        await ctx.info("Getting current project information")
+
+    current_project = session.get_current_project()
+    project_config = get_project_config(current_project)
+    result = f"Current project: {current_project}\n\n"
+
+    # get project stats
+    response = await call_get(
+        client,
+        f"{project_config.project_url}/project/info",
+        params={"project_name": current_project},
+    )
+    project_info = ProjectInfoResponse.model_validate(response.json())
 
     return result
 
@@ -175,6 +297,9 @@ async def delete_project(project_name: str, context: Context | None = None) -> s
         raise ValueError(
             f"Project '{project_name}' not found. Available projects: {', '.join(available_projects)}"
         )
+    
+    # Use the actual project name from the list (correct case)
+    actual_project_name = matching_project.name
 
     # Call API to delete project using URL encoding for special characters
     from urllib.parse import quote
