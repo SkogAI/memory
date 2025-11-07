@@ -13,16 +13,14 @@ from basic_memory.deps import get_project_config, get_engine_factory, get_app_co
 from basic_memory.services.search_service import SearchService
 from basic_memory.mcp.server import mcp as mcp_server
 
-from basic_memory.config import app_config as basic_memory_app_config  # noqa: F401
-
 
 @pytest.fixture(scope="function")
 def mcp() -> FastMCP:
-    return mcp_server
+    return mcp_server  # pyright: ignore [reportReturnType]
 
 
 @pytest.fixture(scope="function")
-def app(app_config, project_config, engine_factory, project_session, config_manager) -> FastAPI:
+def app(app_config, project_config, engine_factory, config_manager) -> FastAPI:
     """Create test FastAPI application."""
     app = fastapi_app
     app.dependency_overrides[get_app_config] = lambda: app_config

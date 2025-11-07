@@ -153,7 +153,7 @@ The note embeds semantic content and links to other topics via simple Markdown f
 
 3. You see this file on your computer in real time in the current project directory (default `~/$HOME/basic-memory`).
 
-- Realtime sync is enabled by default with the v0.12.0 version
+- Realtime sync can be enabled via running `basic-memory sync --watch`
 
 4. In a chat with the LLM, you can reference a topic:
 
@@ -263,13 +263,6 @@ Examples of relations:
 ```
 
 ## Using with VS Code
-For one-click installation, click one of the install buttons below...
-
-[![Install with UV in VS Code](https://img.shields.io/badge/VS_Code-UV-0098FF?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=basic-memory&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22basic-memory%22%2C%22mcp%22%5D%7D) [![Install with UV in VS Code Insiders](https://img.shields.io/badge/VS_Code_Insiders-UV-24bfa5?style=flat-square&logo=visualstudiocode&logoColor=white)](https://insiders.vscode.dev/redirect/mcp/install?name=basic-memory&config=%7B%22command%22%3A%22uvx%22%2C%22args%22%3A%5B%22basic-memory%22%2C%22mcp%22%5D%7D&quality=insiders)
-
-You can use Basic Memory with VS Code to easily retrieve and store information while coding. Click the installation buttons above for one-click setup, or follow the manual installation instructions below.
-
-### Manual Installation
 
 Add the following JSON block to your User Settings (JSON) file in VS Code. You can do this by pressing `Ctrl + Shift + P` and typing `Preferences: Open User Settings (JSON)`.
 
@@ -299,6 +292,8 @@ Optionally, you can add it to a file called `.vscode/mcp.json` in your workspace
 }
 ```
 
+You can use Basic Memory with VS Code to easily retrieve and store information while coding.
+
 ## Using with Claude Desktop
 
 Basic Memory is built using the MCP (Model Context Protocol) and works with the Claude desktop app (https://claude.ai/):
@@ -322,8 +317,7 @@ for OS X):
 }
 ```
 
-If you want to use a specific project (see [Multiple Projects](docs/User%20Guide.md#multiple-projects)), update your
-Claude Desktop
+If you want to use a specific project (see [Multiple Projects](#multiple-projects) below), update your Claude Desktop
 config:
 
 ```json
@@ -333,9 +327,9 @@ config:
       "command": "uvx",
       "args": [
         "basic-memory",
+        "mcp",
         "--project",
-        "your-project-name",
-        "mcp"
+        "your-project-name"
       ]
     }
   }
@@ -344,7 +338,13 @@ config:
 
 2. Sync your knowledge:
 
-Basic Memory will sync the files in your project in real time if you make manual edits.
+```bash
+# One-time sync of local knowledge updates
+basic-memory sync
+
+# Run realtime sync process (recommended)
+basic-memory sync --watch
+```
 
 3. In Claude Desktop, the LLM can now use these tools:
 
@@ -352,7 +352,7 @@ Basic Memory will sync the files in your project in real time if you make manual
 write_note(title, content, folder, tags) - Create or update notes
 read_note(identifier, page, page_size) - Read notes by title or permalink
 build_context(url, depth, timeframe) - Navigate knowledge graph via memory:// URLs
-search_notes(query, page, page_size) - Search across your knowledge base
+search(query, page, page_size) - Search across your knowledge base
 recent_activity(type, depth, timeframe) - Find recently updated information
 canvas(nodes, edges, title, folder) - Generate knowledge visualizations
 ```
@@ -375,24 +375,6 @@ See the [Documentation](https://memory.basicmachines.co/) for more info, includi
 - [CLI tools](https://memory.basicmachines.co/docs/cli-reference)
 - [Managing multiple Projects](https://memory.basicmachines.co/docs/cli-reference#project)
 - [Importing data from OpenAI/Claude Projects](https://memory.basicmachines.co/docs/cli-reference#import)
-
-## Installation Options
-
-### Stable Release
-```bash
-pip install basic-memory
-```
-
-### Beta/Pre-releases
-```bash
-pip install basic-memory --pre
-```
-
-### Development Builds
-Development versions are automatically published on every commit to main with versions like `0.12.4.dev26+468a22f`:
-```bash
-pip install basic-memory --pre --force-reinstall
-```
 
 ## License
 

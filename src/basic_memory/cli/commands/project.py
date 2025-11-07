@@ -9,8 +9,6 @@ from rich.console import Console
 from rich.table import Table
 
 from basic_memory.cli.app import app
-from basic_memory.config import config
-from basic_memory.mcp.project_session import session
 from basic_memory.mcp.resources.project_info import project_info
 import json
 from datetime import datetime
@@ -24,6 +22,8 @@ from basic_memory.mcp.tools.utils import call_post
 from basic_memory.schemas.project_info import ProjectStatusResponse
 from basic_memory.mcp.tools.utils import call_delete
 from basic_memory.mcp.tools.utils import call_put
+from basic_memory.utils import generate_permalink
+from basic_memory.mcp.tools.utils import call_patch
 
 console = Console()
 
@@ -44,28 +44,22 @@ def format_path(path: str) -> str:
 def list_projects() -> None:
     """List all configured projects."""
     # Use API to list projects
-
-    project_url = config.project_url
-
     try:
-        response = asyncio.run(call_get(client, f"{project_url}/project/projects"))
+        response = asyncio.run(call_get(client, "/projects/projects"))
         result = ProjectList.model_validate(response.json())
 
         table = Table(title="Basic Memory Projects")
         table.add_column("Name", style="cyan")
         table.add_column("Path", style="green")
-        table.add_column("Default", style="yellow")
-        table.add_column("Active", style="magenta")
+        table.add_column("Default", style="magenta")
 
         for project in result.projects:
             is_default = "✓" if project.is_default else ""
-            is_active = "✓" if session.get_current_project() == project.name else ""
-            table.add_row(project.name, format_path(project.path), is_default, is_active)
+            table.add_row(project.name, format_path(project.path), is_default)
 
         console.print(table)
     except Exception as e:
         console.print(f"[red]Error listing projects: {str(e)}[/red]")
-        console.print("[yellow]Note: Make sure the Basic Memory server is running.[/yellow]")
         raise typer.Exit(1)
 
 
@@ -77,19 +71,17 @@ def add_project(
 ) -> None:
     """Add a new project."""
     # Resolve to absolute path
-    resolved_path = os.path.abspath(os.path.expanduser(path))
+    resolved_path = Path(os.path.abspath(os.path.expanduser(path))).as_posix()
 
     try:
-        project_url = config.project_url
         data = {"name": name, "path": resolved_path, "set_default": set_default}
 
-        response = asyncio.run(call_post(client, f"{project_url}/project/projects", json=data))
+        response = asyncio.run(call_post(client, "/projects/projects", json=data))
         result = ProjectStatusResponse.model_validate(response.json())
 
         console.print(f"[green]{result.message}[/green]")
     except Exception as e:
         console.print(f"[red]Error adding project: {str(e)}[/red]")
-        console.print("[yellow]Note: Make sure the Basic Memory server is running.[/yellow]")
         raise typer.Exit(1)
 
     # Display usage hint
@@ -105,15 +97,13 @@ def remove_project(
 ) -> None:
     """Remove a project from configuration."""
     try:
-        project_url = config.project_url
-
-        response = asyncio.run(call_delete(client, f"{project_url}/project/projects/{name}"))
+        project_permalink = generate_permalink(name)
+        response = asyncio.run(call_delete(client, f"/projects/{project_permalink}"))
         result = ProjectStatusResponse.model_validate(response.json())
 
         console.print(f"[green]{result.message}[/green]")
     except Exception as e:
         console.print(f"[red]Error removing project: {str(e)}[/red]")
-        console.print("[yellow]Note: Make sure the Basic Memory server is running.[/yellow]")
         raise typer.Exit(1)
 
     # Show this message regardless of method used
@@ -122,48 +112,78 @@ def remove_project(
 
 @project_app.command("default")
 def set_default_project(
-    name: str = typer.Argument(..., help="Name of the project to set as default"),
+    name: str = typer.Argument(..., help="Name of the project to set as CLI default"),
 ) -> None:
-    """Set the default project and activate it for the current session."""
+    """Set the default project for CLI operations (when no --project flag is specified)."""
     try:
-        project_url = config.project_url
-
-        response = asyncio.run(call_put(client, f"{project_url}/project/projects/{name}/default"))
+        project_permalink = generate_permalink(name)
+        response = asyncio.run(call_put(client, f"/projects/{project_permalink}/default"))
         result = ProjectStatusResponse.model_validate(response.json())
 
         console.print(f"[green]{result.message}[/green]")
     except Exception as e:
         console.print(f"[red]Error setting default project: {str(e)}[/red]")
-        console.print("[yellow]Note: Make sure the Basic Memory server is running.[/yellow]")
         raise typer.Exit(1)
 
-    # Always activate it for the current session
-    os.environ["BASIC_MEMORY_PROJECT"] = name
-
-    # Reload configuration to apply the change
-    from importlib import reload
-    from basic_memory import config as config_module
-
-    reload(config_module)
-
-    console.print("[green]Project activated for current session[/green]")
+    # The API call above updates the config file default
+    console.print(
+        f"[green]CLI commands will now use '{name}' when no --project flag is specified[/green]"
+    )
 
 
-@project_app.command("sync")
+@project_app.command("sync-config")
 def synchronize_projects() -> None:
-    """Synchronize projects between configuration file and database."""
+    """Synchronize project config between configuration file and database."""
     # Call the API to synchronize projects
 
-    project_url = config.project_url
-
     try:
-        response = asyncio.run(call_post(client, f"{project_url}/project/sync"))
+        response = asyncio.run(call_post(client, "/projects/sync"))
         result = ProjectStatusResponse.model_validate(response.json())
 
         console.print(f"[green]{result.message}[/green]")
     except Exception as e:  # pragma: no cover
         console.print(f"[red]Error synchronizing projects: {str(e)}[/red]")
-        console.print("[yellow]Note: Make sure the Basic Memory server is running.[/yellow]")
+        raise typer.Exit(1)
+
+
+@project_app.command("move")
+def move_project(
+    name: str = typer.Argument(..., help="Name of the project to move"),
+    new_path: str = typer.Argument(..., help="New absolute path for the project"),
+) -> None:
+    """Move a project to a new location."""
+    # Resolve to absolute path
+    resolved_path = Path(os.path.abspath(os.path.expanduser(new_path))).as_posix()
+
+    try:
+        data = {"path": resolved_path}
+
+        project_permalink = generate_permalink(name)
+
+        # TODO fix route to use ProjectPathDep
+        response = asyncio.run(
+            call_patch(client, f"/{name}/project/{project_permalink}", json=data)
+        )
+        result = ProjectStatusResponse.model_validate(response.json())
+
+        console.print(f"[green]{result.message}[/green]")
+
+        # Show important file movement reminder
+        console.print()  # Empty line for spacing
+        console.print(
+            Panel(
+                "[bold red]IMPORTANT:[/bold red] Project configuration updated successfully.\n\n"
+                "[yellow]You must manually move your project files from the old location to:[/yellow]\n"
+                f"[cyan]{resolved_path}[/cyan]\n\n"
+                "[dim]Basic Memory has only updated the configuration - your files remain in their original location.[/dim]",
+                title="⚠️  Manual File Movement Required",
+                border_style="yellow",
+                expand=False,
+            )
+        )
+
+    except Exception as e:
+        console.print(f"[red]Error moving project: {str(e)}[/red]")
         raise typer.Exit(1)
 
 

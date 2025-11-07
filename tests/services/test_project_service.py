@@ -1,6 +1,7 @@
 """Tests for ProjectService."""
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -73,7 +74,7 @@ async def test_project_operations_sync_methods(
     """
     # Generate a unique project name for testing
     test_project_name = f"test-project-{os.urandom(4).hex()}"
-    test_project_path = str(tmp_path / "test-project")
+    test_project_path = (tmp_path / "test-project").as_posix()
 
     # Make sure the test directory exists
     os.makedirs(test_project_path, exist_ok=True)
@@ -167,7 +168,7 @@ async def test_get_project_info(project_service: ProjectService, test_graph, tes
 async def test_add_project_async(project_service: ProjectService, tmp_path):
     """Test adding a project with the updated async method."""
     test_project_name = f"test-async-project-{os.urandom(4).hex()}"
-    test_project_path = str(tmp_path / "test-async-project")
+    test_project_path = (tmp_path / "test-async-project").as_posix()
 
     # Make sure the test directory exists
     os.makedirs(test_project_path, exist_ok=True)
@@ -243,7 +244,7 @@ async def test_set_default_project_async(project_service: ProjectService, tmp_pa
 async def test_get_project_method(project_service: ProjectService, tmp_path):
     """Test the get_project method directly."""
     test_project_name = f"test-get-project-{os.urandom(4).hex()}"
-    test_project_path = str(tmp_path / "test-get-project")
+    test_project_path = (tmp_path / "test-get-project").as_posix()
 
     # Make sure the test directory exists
     os.makedirs(test_project_path, exist_ok=True)
@@ -442,10 +443,9 @@ async def test_synchronize_projects_calls_ensure_single_default(
     # Make sure the test directory exists
     os.makedirs(test_project_path, exist_ok=True)
 
+    config_manager = ConfigManager()
     try:
         # Add project to config only (simulating unsynchronized state)
-        from basic_memory.config import config_manager
-
         config_manager.add_project(test_project_name, test_project_path)
 
         # Verify it's in config but not in database
@@ -484,18 +484,14 @@ async def test_synchronize_projects_normalizes_project_names(
     # Make sure the test directory exists
     os.makedirs(test_project_path, exist_ok=True)
 
-    # Import config manager outside try block
-    from basic_memory.config import config_manager
-
+    config_manager = ConfigManager()
     try:
         # Manually add the unnormalized project name to config
 
-        # Save the original config state for potential debugging
-        # original_projects = config_manager.projects.copy()
-
         # Add project with unnormalized name directly to config
-        config_manager.config.projects[unnormalized_name] = test_project_path
-        config_manager.save_config(config_manager.config)
+        config = config_manager.load_config()
+        config.projects[unnormalized_name] = test_project_path
+        config_manager.save_config(config)
 
         # Verify the unnormalized name is in config
         assert unnormalized_name in project_service.projects
@@ -541,6 +537,124 @@ async def test_synchronize_projects_normalizes_project_names(
 
 
 @pytest.mark.asyncio
+async def test_move_project(project_service: ProjectService, tmp_path):
+    """Test moving a project to a new location."""
+    test_project_name = f"test-move-project-{os.urandom(4).hex()}"
+    old_path = (tmp_path / "old-location").as_posix()
+    new_path = (tmp_path / "new-location").as_posix()
+
+    # Create old directory
+    os.makedirs(old_path, exist_ok=True)
+
+    try:
+        # Add project with initial path
+        await project_service.add_project(test_project_name, old_path)
+
+        # Verify initial state
+        assert test_project_name in project_service.projects
+        assert project_service.projects[test_project_name] == old_path
+
+        project = await project_service.repository.get_by_name(test_project_name)
+        assert project is not None
+        assert project.path == old_path
+
+        # Move project to new location
+        await project_service.move_project(test_project_name, new_path)
+
+        # Verify config was updated
+        assert project_service.projects[test_project_name] == new_path
+
+        # Verify database was updated
+        updated_project = await project_service.repository.get_by_name(test_project_name)
+        assert updated_project is not None
+        assert updated_project.path == new_path
+
+        # Verify new directory was created
+        assert os.path.exists(new_path)
+
+    finally:
+        # Clean up
+        if test_project_name in project_service.projects:
+            await project_service.remove_project(test_project_name)
+
+
+@pytest.mark.asyncio
+async def test_move_project_nonexistent(project_service: ProjectService, tmp_path):
+    """Test moving a project that doesn't exist."""
+    new_path = str(tmp_path / "new-location")
+
+    with pytest.raises(ValueError, match="not found in configuration"):
+        await project_service.move_project("nonexistent-project", new_path)
+
+
+@pytest.mark.asyncio
+async def test_move_project_db_mismatch(project_service: ProjectService, tmp_path):
+    """Test moving a project that exists in config but not in database."""
+    test_project_name = f"test-move-mismatch-{os.urandom(4).hex()}"
+    old_path = (tmp_path / "old-location").as_posix()
+    new_path = (tmp_path / "new-location").as_posix()
+
+    # Create directories
+    os.makedirs(old_path, exist_ok=True)
+
+    config_manager = project_service.config_manager
+
+    try:
+        # Add project to config only (not to database)
+        config_manager.add_project(test_project_name, old_path)
+
+        # Verify it's in config but not in database
+        assert test_project_name in project_service.projects
+        db_project = await project_service.repository.get_by_name(test_project_name)
+        assert db_project is None
+
+        # Try to move project - should fail and restore config
+        with pytest.raises(ValueError, match="not found in database"):
+            await project_service.move_project(test_project_name, new_path)
+
+        # Verify config was restored to original path
+        assert project_service.projects[test_project_name] == old_path
+
+    finally:
+        # Clean up
+        if test_project_name in project_service.projects:
+            config_manager.remove_project(test_project_name)
+
+
+@pytest.mark.asyncio
+async def test_move_project_expands_path(project_service: ProjectService, tmp_path):
+    """Test that move_project expands ~ and relative paths."""
+    test_project_name = f"test-move-expand-{os.urandom(4).hex()}"
+    old_path = (tmp_path / "old-location").as_posix()
+
+    # Create old directory
+    os.makedirs(old_path, exist_ok=True)
+
+    try:
+        # Add project with initial path
+        await project_service.add_project(test_project_name, old_path)
+
+        # Use a relative path for the move
+        relative_new_path = "./new-location"
+        expected_absolute_path = Path(os.path.abspath(relative_new_path)).as_posix()
+
+        # Move project using relative path
+        await project_service.move_project(test_project_name, relative_new_path)
+
+        # Verify the path was expanded to absolute
+        assert project_service.projects[test_project_name] == expected_absolute_path
+
+        updated_project = await project_service.repository.get_by_name(test_project_name)
+        assert updated_project is not None
+        assert updated_project.path == expected_absolute_path
+
+    finally:
+        # Clean up
+        if test_project_name in project_service.projects:
+            await project_service.remove_project(test_project_name)
+
+
+@pytest.mark.asyncio
 async def test_synchronize_projects_handles_case_sensitivity_bug(
     project_service: ProjectService, tmp_path
 ):
@@ -553,13 +667,12 @@ async def test_synchronize_projects_handles_case_sensitivity_bug(
     # Make sure the test directory exists
     os.makedirs(test_project_path, exist_ok=True)
 
-    # Import config manager outside try block
-    from basic_memory.config import config_manager
-
+    config_manager = ConfigManager()
     try:
         # Add project with uppercase name to config (simulating the bug scenario)
-        config_manager.config.projects[config_name] = test_project_path
-        config_manager.save_config(config_manager.config)
+        config = config_manager.load_config()
+        config.projects[config_name] = test_project_path
+        config_manager.save_config(config)
 
         # Verify the uppercase name is in config
         assert config_name in project_service.projects

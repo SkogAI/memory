@@ -9,7 +9,6 @@ from typing import Dict, Optional, Sequence
 from loguru import logger
 from sqlalchemy import text
 
-from basic_memory.config import config, app_config
 from basic_memory.models import Project
 from basic_memory.repository.project_repository import ProjectRepository
 from basic_memory.schemas import (
@@ -18,9 +17,8 @@ from basic_memory.schemas import (
     ProjectStatistics,
     SystemStatus,
 )
-from basic_memory.config import WATCH_STATUS_JSON
+from basic_memory.config import WATCH_STATUS_JSON, ConfigManager, get_project_config, ProjectConfig
 from basic_memory.utils import generate_permalink
-from basic_memory.config import config_manager
 
 
 class ProjectService:
@@ -34,13 +32,31 @@ class ProjectService:
         self.repository = repository
 
     @property
+    def config_manager(self) -> ConfigManager:
+        """Get a ConfigManager instance.
+
+        Returns:
+            Fresh ConfigManager instance for each access
+        """
+        return ConfigManager()
+
+    @property
+    def config(self) -> ProjectConfig:
+        """Get the current project configuration.
+
+        Returns:
+            Current project configuration
+        """
+        return get_project_config()
+
+    @property
     def projects(self) -> Dict[str, str]:
         """Get all configured projects.
 
         Returns:
             Dict mapping project names to their file paths
         """
-        return config_manager.projects
+        return self.config_manager.projects
 
     @property
     def default_project(self) -> str:
@@ -49,7 +65,7 @@ class ProjectService:
         Returns:
             The name of the default project
         """
-        return config_manager.default_project
+        return self.config_manager.default_project
 
     @property
     def current_project(self) -> str:
@@ -58,14 +74,16 @@ class ProjectService:
         Returns:
             The name of the current project
         """
-        return os.environ.get("BASIC_MEMORY_PROJECT", config_manager.default_project)
+        return os.environ.get("BASIC_MEMORY_PROJECT", self.config_manager.default_project)
 
     async def list_projects(self) -> Sequence[Project]:
         return await self.repository.find_all()
 
     async def get_project(self, name: str) -> Optional[Project]:
-        """Get the file path for a project by name."""
-        return await self.repository.get_by_name(name)
+        """Get the file path for a project by name or permalink."""
+        return await self.repository.get_by_name(name) or await self.repository.get_by_permalink(
+            name
+        )
 
     async def add_project(self, name: str, path: str, set_default: bool = False) -> None:
         """Add a new project to the configuration and database.
@@ -82,10 +100,10 @@ class ProjectService:
             raise ValueError("Repository is required for add_project")
 
         # Resolve to absolute path
-        resolved_path = os.path.abspath(os.path.expanduser(path))
+        resolved_path = Path(os.path.abspath(os.path.expanduser(path))).as_posix()
 
         # First add to config file (this will validate the project doesn't exist)
-        project_config = config_manager.add_project(name, resolved_path)
+        project_config = self.config_manager.add_project(name, resolved_path)
 
         # Then add to database
         project_data = {
@@ -101,7 +119,7 @@ class ProjectService:
         # If this should be the default project, ensure only one default exists
         if set_default:
             await self.repository.set_as_default(created_project.id)
-            config_manager.set_default_project(name)
+            self.config_manager.set_default_project(name)
             logger.info(f"Project '{name}' set as default")
 
         logger.info(f"Project '{name}' added at {resolved_path}")
@@ -119,10 +137,10 @@ class ProjectService:
             raise ValueError("Repository is required for remove_project")
 
         # First remove from config (this will validate the project exists and is not default)
-        config_manager.remove_project(name)
+        self.config_manager.remove_project(name)
 
-        # Then remove from database
-        project = await self.repository.get_by_name(name)
+        # Then remove from database using robust lookup
+        project = await self.get_project(name)
         if project:
             await self.repository.delete(project.id)
 
@@ -141,10 +159,10 @@ class ProjectService:
             raise ValueError("Repository is required for set_default_project")
 
         # First update config file (this will validate the project exists)
-        config_manager.set_default_project(name)
+        self.config_manager.set_default_project(name)
 
-        # Then update database
-        project = await self.repository.get_by_name(name)
+        # Then update database using the same lookup logic as get_project
+        project = await self.get_project(name)
         if project:
             await self.repository.set_as_default(project.id)
         else:
@@ -185,7 +203,7 @@ class ProjectService:
         elif len(default_projects) == 0:  # pragma: no cover
             # No default project - set the config default as default
             # This is defensive code for edge cases where no default exists
-            config_default = config_manager.default_project  # pragma: no cover
+            config_default = self.config_manager.default_project  # pragma: no cover
             config_project = await self.repository.get_by_name(config_default)  # pragma: no cover
             if config_project:  # pragma: no cover
                 await self.repository.set_as_default(config_project.id)  # pragma: no cover
@@ -207,10 +225,10 @@ class ProjectService:
 
         # Get all projects from database
         db_projects = await self.repository.get_active_projects()
-        db_projects_by_name = {p.name: p for p in db_projects}
+        db_projects_by_permalink = {p.permalink: p for p in db_projects}
 
         # Get all projects from configuration and normalize names if needed
-        config_projects = config_manager.projects.copy()
+        config_projects = self.config_manager.projects.copy()
         updated_config = {}
         config_updated = False
 
@@ -226,8 +244,9 @@ class ProjectService:
 
         # Update the configuration if any changes were made
         if config_updated:
-            config_manager.config.projects = updated_config
-            config_manager.save_config(config_manager.config)
+            config = self.config_manager.load_config()
+            config.projects = updated_config
+            self.config_manager.save_config(config)
             logger.info("Config updated with normalized project names")
 
         # Use the normalized config for further processing
@@ -235,7 +254,7 @@ class ProjectService:
 
         # Add projects that exist in config but not in DB
         for name, path in config_projects.items():
-            if name not in db_projects_by_name:
+            if name not in db_projects_by_permalink:
                 logger.info(f"Adding project '{name}' to database")
                 project_data = {
                     "name": name,
@@ -247,22 +266,22 @@ class ProjectService:
                 await self.repository.create(project_data)
 
         # Add projects that exist in DB but not in config to config
-        for name, project in db_projects_by_name.items():
+        for name, project in db_projects_by_permalink.items():
             if name not in config_projects:
                 logger.info(f"Adding project '{name}' to configuration")
-                config_manager.add_project(name, project.path)
+                self.config_manager.add_project(name, project.path)
 
         # Ensure database default project state is consistent
         await self._ensure_single_default_project()
 
         # Make sure default project is synchronized between config and database
         db_default = await self.repository.get_default_project()
-        config_default = config_manager.default_project
+        config_default = self.config_manager.default_project
 
         if db_default and db_default.name != config_default:
             # Update config to match DB default
             logger.info(f"Updating default project in config to '{db_default.name}'")
-            config_manager.set_default_project(db_default.name)
+            self.config_manager.set_default_project(db_default.name)
         elif not db_default and config_default:
             # Update DB to match config default (if the project exists)
             project = await self.repository.get_by_name(config_default)
@@ -271,6 +290,47 @@ class ProjectService:
                 await self.repository.set_as_default(project.id)
 
         logger.info("Project synchronization complete")
+
+    async def move_project(self, name: str, new_path: str) -> None:
+        """Move a project to a new location.
+
+        Args:
+            name: The name of the project to move
+            new_path: The new absolute path for the project
+
+        Raises:
+            ValueError: If the project doesn't exist or repository isn't initialized
+        """
+        if not self.repository:
+            raise ValueError("Repository is required for move_project")
+
+        # Resolve to absolute path
+        resolved_path = Path(os.path.abspath(os.path.expanduser(new_path))).as_posix()
+
+        # Validate project exists in config
+        if name not in self.config_manager.projects:
+            raise ValueError(f"Project '{name}' not found in configuration")
+
+        # Create the new directory if it doesn't exist
+        Path(resolved_path).mkdir(parents=True, exist_ok=True)
+
+        # Update in configuration
+        config = self.config_manager.load_config()
+        old_path = config.projects[name]
+        config.projects[name] = resolved_path
+        self.config_manager.save_config(config)
+
+        # Update in database using robust lookup
+        project = await self.get_project(name)
+        if project:
+            await self.repository.update_path(project.id, resolved_path)
+            logger.info(f"Moved project '{name}' from {old_path} to {resolved_path}")
+        else:
+            logger.error(f"Project '{name}' exists in config but not in database")
+            # Restore the old path in config since DB update failed
+            config.projects[name] = old_path
+            self.config_manager.save_config(config)
+            raise ValueError(f"Project '{name}' not found in database")
 
     async def update_project(  # pragma: no cover
         self, name: str, updated_path: Optional[str] = None, is_active: Optional[bool] = None
@@ -289,24 +349,23 @@ class ProjectService:
             raise ValueError("Repository is required for update_project")
 
         # Validate project exists in config
-        if name not in config_manager.projects:
+        if name not in self.config_manager.projects:
             raise ValueError(f"Project '{name}' not found in configuration")
 
-        # Get project from database
-        project = await self.repository.get_by_name(name)
+        # Get project from database using robust lookup
+        project = await self.get_project(name)
         if not project:
             logger.error(f"Project '{name}' exists in config but not in database")
             return
 
         # Update path if provided
         if updated_path:
-            resolved_path = os.path.abspath(os.path.expanduser(updated_path))
+            resolved_path = Path(os.path.abspath(os.path.expanduser(updated_path))).as_posix()
 
             # Update in config
-            projects = config_manager.config.projects.copy()
-            projects[name] = resolved_path
-            config_manager.config.projects = projects
-            config_manager.save_config(config_manager.config)
+            config = self.config_manager.load_config()
+            config.projects[name] = resolved_path
+            self.config_manager.save_config(config)
 
             # Update in database
             project.path = resolved_path
@@ -327,7 +386,7 @@ class ProjectService:
             if active_projects:
                 new_default = active_projects[0]
                 await self.repository.set_as_default(new_default.id)
-                config_manager.set_default_project(new_default.name)
+                self.config_manager.set_default_project(new_default.name)
                 logger.info(
                     f"Changed default project to '{new_default.name}' as '{name}' was deactivated"
                 )
@@ -345,14 +404,17 @@ class ProjectService:
             raise ValueError("Repository is required for get_project_info")
 
         # Use specified project or fall back to config project
-        project_name = project_name or config.project
+        project_name = project_name or self.config.project
         # Get project path from configuration
-        project_path = config_manager.projects.get(project_name)
-        if not project_path:  # pragma: no cover
+        name, project_path = self.config_manager.get_project(project_name)
+        if not name:  # pragma: no cover
             raise ValueError(f"Project '{project_name}' not found in configuration")
 
+        assert project_path is not None
+        project_permalink = generate_permalink(project_name)
+
         # Get project from database to get project_id
-        db_project = await self.repository.get_by_name(project_name)
+        db_project = await self.repository.get_by_permalink(project_permalink)
         if not db_project:  # pragma: no cover
             raise ValueError(f"Project '{project_name}' not found in database")
 
@@ -367,15 +429,16 @@ class ProjectService:
 
         # Get enhanced project information from database
         db_projects = await self.repository.get_active_projects()
-        db_projects_by_name = {p.name: p for p in db_projects}
+        db_projects_by_permalink = {p.permalink: p for p in db_projects}
 
         # Get default project info
-        default_project = config_manager.default_project
+        default_project = self.config_manager.default_project
 
         # Convert config projects to include database info
         enhanced_projects = {}
-        for name, path in config_manager.projects.items():
-            db_project = db_projects_by_name.get(name)
+        for name, path in self.config_manager.projects.items():
+            config_permalink = generate_permalink(name)
+            db_project = db_projects_by_permalink.get(config_permalink)
             enhanced_projects[name] = {
                 "path": path,
                 "active": db_project.is_active if db_project else True,
@@ -649,7 +712,7 @@ class ProjectService:
         import basic_memory
 
         # Get database information
-        db_path = app_config.database_path
+        db_path = self.config_manager.config.database_path
         db_size = db_path.stat().st_size if db_path.exists() else 0
         db_size_readable = f"{db_size / (1024 * 1024):.2f} MB"
 

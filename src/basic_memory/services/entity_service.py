@@ -9,12 +9,18 @@ from loguru import logger
 from sqlalchemy.exc import IntegrityError
 
 from basic_memory.config import ProjectConfig, BasicMemoryConfig
-from basic_memory.file_utils import has_frontmatter, parse_frontmatter, remove_frontmatter
+from basic_memory.file_utils import (
+    has_frontmatter,
+    parse_frontmatter,
+    remove_frontmatter,
+    dump_frontmatter,
+)
 from basic_memory.markdown import EntityMarkdown
 from basic_memory.markdown.entity_parser import EntityParser
 from basic_memory.markdown.utils import entity_model_from_markdown, schema_to_markdown
 from basic_memory.models import Entity as EntityModel
 from basic_memory.models import Observation, Relation
+from basic_memory.models.knowledge import Entity
 from basic_memory.repository import ObservationRepository, RelationRepository
 from basic_memory.repository.entity_repository import EntityRepository
 from basic_memory.schemas import Entity as EntitySchema
@@ -44,6 +50,39 @@ class EntityService(BaseService[EntityModel]):
         self.file_service = file_service
         self.link_resolver = link_resolver
 
+    async def detect_file_path_conflicts(self, file_path: str) -> List[Entity]:
+        """Detect potential file path conflicts for a given file path.
+
+        This checks for entities with similar file paths that might cause conflicts:
+        - Case sensitivity differences (Finance/file.md vs finance/file.md)
+        - Character encoding differences
+        - Hyphen vs space differences
+        - Unicode normalization differences
+
+        Args:
+            file_path: The file path to check for conflicts
+
+        Returns:
+            List of entities that might conflict with the given file path
+        """
+        from basic_memory.utils import detect_potential_file_conflicts
+
+        conflicts = []
+
+        # Get all existing file paths
+        all_entities = await self.repository.find_all()
+        existing_paths = [entity.file_path for entity in all_entities]
+
+        # Use the enhanced conflict detection utility
+        conflicting_paths = detect_potential_file_conflicts(file_path, existing_paths)
+
+        # Find the entities corresponding to conflicting paths
+        for entity in all_entities:
+            if entity.file_path in conflicting_paths:
+                conflicts.append(entity)
+
+        return conflicts
+
     async def resolve_permalink(
         self, file_path: Permalink | Path, markdown: Optional[EntityMarkdown] = None
     ) -> str:
@@ -54,18 +93,30 @@ class EntityService(BaseService[EntityModel]):
         2. If markdown has permalink but it's used by another file -> make unique
         3. For existing files, keep current permalink from db
         4. Generate new unique permalink from file path
+
+        Enhanced to detect and handle character-related conflicts.
         """
+        file_path_str = Path(file_path).as_posix()
+
+        # Check for potential file path conflicts before resolving permalink
+        conflicts = await self.detect_file_path_conflicts(file_path_str)
+        if conflicts:
+            logger.warning(
+                f"Detected potential file path conflicts for '{file_path_str}': "
+                f"{[entity.file_path for entity in conflicts]}"
+            )
+
         # If markdown has explicit permalink, try to validate it
         if markdown and markdown.frontmatter.permalink:
             desired_permalink = markdown.frontmatter.permalink
             existing = await self.repository.get_by_permalink(desired_permalink)
 
             # If no conflict or it's our own file, use as is
-            if not existing or existing.file_path == str(file_path):
+            if not existing or existing.file_path == file_path_str:
                 return desired_permalink
 
         # For existing files, try to find current permalink
-        existing = await self.repository.get_by_file_path(str(file_path))
+        existing = await self.repository.get_by_file_path(file_path_str)
         if existing:
             return existing.permalink
 
@@ -73,9 +124,9 @@ class EntityService(BaseService[EntityModel]):
         if markdown and markdown.frontmatter.permalink:
             desired_permalink = markdown.frontmatter.permalink
         else:
-            desired_permalink = generate_permalink(file_path)
+            desired_permalink = generate_permalink(file_path_str)
 
-        # Make unique if needed
+        # Make unique if needed - enhanced to handle character conflicts
         permalink = desired_permalink
         suffix = 1
         while await self.repository.get_by_permalink(permalink):
@@ -117,10 +168,15 @@ class EntityService(BaseService[EntityModel]):
                 f"file for entity {schema.folder}/{schema.title} already exists: {file_path}"
             )
 
-        # Parse content frontmatter to check for user-specified permalink
+        # Parse content frontmatter to check for user-specified permalink and entity_type
         content_markdown = None
         if schema.content and has_frontmatter(schema.content):
             content_frontmatter = parse_frontmatter(schema.content)
+
+            # If content has entity_type/type, use it to override the schema entity_type
+            if "type" in content_frontmatter:
+                schema.entity_type = content_frontmatter["type"]
+
             if "permalink" in content_frontmatter:
                 # Create a minimal EntityMarkdown object for permalink resolution
                 from basic_memory.markdown.schemas import EntityFrontmatter
@@ -145,7 +201,7 @@ class EntityService(BaseService[EntityModel]):
         post = await schema_to_markdown(schema)
 
         # write file
-        final_content = frontmatter.dumps(post, sort_keys=False)
+        final_content = dump_frontmatter(post)
         checksum = await self.file_service.write_file(file_path, final_content)
 
         # parse entity from file
@@ -172,10 +228,15 @@ class EntityService(BaseService[EntityModel]):
         # Read existing frontmatter from the file if it exists
         existing_markdown = await self.entity_parser.parse_file(file_path)
 
-        # Parse content frontmatter to check for user-specified permalink
+        # Parse content frontmatter to check for user-specified permalink and entity_type
         content_markdown = None
         if schema.content and has_frontmatter(schema.content):
             content_frontmatter = parse_frontmatter(schema.content)
+
+            # If content has entity_type/type, use it to override the schema entity_type
+            if "type" in content_frontmatter:
+                schema.entity_type = content_frontmatter["type"]
+
             if "permalink" in content_frontmatter:
                 # Create a minimal EntityMarkdown object for permalink resolution
                 from basic_memory.markdown.schemas import EntityFrontmatter
@@ -217,7 +278,7 @@ class EntityService(BaseService[EntityModel]):
         merged_post = frontmatter.Post(post.content, **existing_markdown.frontmatter.metadata)
 
         # write file
-        final_content = frontmatter.dumps(merged_post, sort_keys=False)
+        final_content = dump_frontmatter(merged_post)
         checksum = await self.file_service.write_file(file_path, final_content)
 
         # parse entity from file
@@ -227,7 +288,7 @@ class EntityService(BaseService[EntityModel]):
         entity = await self.update_entity_and_observations(file_path, entity_markdown)
 
         # add relations
-        await self.update_entity_relations(str(file_path), entity_markdown)
+        await self.update_entity_relations(file_path.as_posix(), entity_markdown)
 
         # Set final checksum to match file
         entity = await self.repository.update(entity.id, {"checksum": checksum})
@@ -292,27 +353,21 @@ class EntityService(BaseService[EntityModel]):
 
         Creates the entity with null checksum to indicate sync not complete.
         Relations will be added in second pass.
+
+        Uses UPSERT approach to handle permalink/file_path conflicts cleanly.
         """
         logger.debug(f"Creating entity: {markdown.frontmatter.title} file_path: {file_path}")
         model = entity_model_from_markdown(file_path, markdown)
 
         # Mark as incomplete because we still need to add relations
         model.checksum = None
-        # Repository will set project_id automatically
+
+        # Use UPSERT to handle conflicts cleanly
         try:
-            return await self.repository.add(model)
-        except IntegrityError as e:
-            # Handle race condition where entity was created by another process
-            if "UNIQUE constraint failed: entity.file_path" in str(
-                e
-            ) or "UNIQUE constraint failed: entity.permalink" in str(e):
-                logger.info(
-                    f"Entity already exists for file_path={file_path} (file_path or permalink conflict), updating instead of creating"
-                )
-                return await self.update_entity_and_observations(file_path, markdown)
-            else:
-                # Re-raise if it's a different integrity error
-                raise
+            return await self.repository.upsert_entity(model)
+        except Exception as e:
+            logger.error(f"Failed to upsert entity for {file_path}: {e}")
+            raise EntityCreationError(f"Failed to create entity: {str(e)}") from e
 
     async def update_entity_and_observations(
         self, file_path: Path, markdown: EntityMarkdown
@@ -324,7 +379,7 @@ class EntityService(BaseService[EntityModel]):
         """
         logger.debug(f"Updating entity and observations: {file_path}")
 
-        db_entity = await self.repository.get_by_file_path(str(file_path))
+        db_entity = await self.repository.get_by_file_path(file_path.as_posix())
 
         # Clear observations for entity
         await self.observation_repository.delete_by_fields(entity_id=db_entity.id)
@@ -367,34 +422,47 @@ class EntityService(BaseService[EntityModel]):
         # Clear existing relations first
         await self.relation_repository.delete_outgoing_relations_from_entity(db_entity.id)
 
-        # Process each relation
-        for rel in markdown.relations:
-            # Resolve the target permalink
-            target_entity = await self.link_resolver.resolve_link(
-                rel.target,
-            )
+        # Batch resolve all relation targets in parallel
+        if markdown.relations:
+            import asyncio
 
-            # if the target is found, store the id
-            target_id = target_entity.id if target_entity else None
-            # if the target is found, store the title, otherwise add the target for a "forward link"
-            target_name = target_entity.title if target_entity else rel.target
+            # Create tasks for all relation lookups
+            lookup_tasks = [
+                self.link_resolver.resolve_link(rel.target) for rel in markdown.relations
+            ]
 
-            # Create the relation
-            relation = Relation(
-                from_id=db_entity.id,
-                to_id=target_id,
-                to_name=target_name,
-                relation_type=rel.type,
-                context=rel.context,
-            )
-            try:
-                await self.relation_repository.add(relation)
-            except IntegrityError:
-                # Unique constraint violation - relation already exists
-                logger.debug(
-                    f"Skipping duplicate relation {rel.type} from {db_entity.permalink} target: {rel.target}"
+            # Execute all lookups in parallel
+            resolved_entities = await asyncio.gather(*lookup_tasks, return_exceptions=True)
+
+            # Process results and create relation records
+            for rel, resolved in zip(markdown.relations, resolved_entities):
+                # Handle exceptions from gather and None results
+                target_entity: Optional[Entity] = None
+                if not isinstance(resolved, Exception):
+                    # Type narrowing: resolved is Optional[Entity] here, not Exception
+                    target_entity = resolved  # type: ignore
+
+                # if the target is found, store the id
+                target_id = target_entity.id if target_entity else None
+                # if the target is found, store the title, otherwise add the target for a "forward link"
+                target_name = target_entity.title if target_entity else rel.target
+
+                # Create the relation
+                relation = Relation(
+                    from_id=db_entity.id,
+                    to_id=target_id,
+                    to_name=target_name,
+                    relation_type=rel.type,
+                    context=rel.context,
                 )
-                continue
+                try:
+                    await self.relation_repository.add(relation)
+                except IntegrityError:
+                    # Unique constraint violation - relation already exists
+                    logger.debug(
+                        f"Skipping duplicate relation {rel.type} from {db_entity.permalink} target: {rel.target}"
+                    )
+                    continue
 
         return await self.repository.get_by_file_path(path)
 
@@ -448,7 +516,7 @@ class EntityService(BaseService[EntityModel]):
 
         # Update entity and its relationships
         entity = await self.update_entity_and_observations(file_path, entity_markdown)
-        await self.update_entity_relations(str(file_path), entity_markdown)
+        await self.update_entity_relations(file_path.as_posix(), entity_markdown)
 
         # Set final checksum to match file
         entity = await self.repository.update(entity.id, {"checksum": checksum})
@@ -678,8 +746,8 @@ class EntityService(BaseService[EntityModel]):
             # 6. Prepare database updates
             updates = {"file_path": destination_path}
 
-            # 7. Update permalink if configured
-            if app_config.update_permalinks_on_move:
+            # 7. Update permalink if configured or if entity has null permalink
+            if app_config.update_permalinks_on_move or old_permalink is None:
                 # Generate new permalink from destination path
                 new_permalink = await self.resolve_permalink(destination_path)
 
@@ -689,7 +757,12 @@ class EntityService(BaseService[EntityModel]):
                 )
 
                 updates["permalink"] = new_permalink
-                logger.info(f"Updated permalink: {old_permalink} -> {new_permalink}")
+                if old_permalink is None:
+                    logger.info(
+                        f"Generated permalink for entity with null permalink: {new_permalink}"
+                    )
+                else:
+                    logger.info(f"Updated permalink: {old_permalink} -> {new_permalink}")
 
             # 8. Recalculate checksum
             new_checksum = await self.file_service.compute_checksum(destination_path)

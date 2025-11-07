@@ -1,5 +1,349 @@
 # CHANGELOG
 
+## v0.14.2 (2025-07-03)
+
+### Bug Fixes
+
+- **#204**: Fix MCP Error with MCP-Hub integration
+  ([`3621bb7`](https://github.com/basicmachines-co/basic-memory/commit/3621bb7b4d6ac12d892b18e36bb8f7c9101c7b10))
+  - Resolve compatibility issues with MCP-Hub
+  - Improve error handling in project management tools
+  - Ensure stable MCP tool integration across different environments
+
+- **Modernize datetime handling and suppress SQLAlchemy warnings**
+  ([`f80ac0e`](https://github.com/basicmachines-co/basic-memory/commit/f80ac0e3e74b7a737a7fc7b956b5c1d61b0c67b8))
+  - Replace deprecated `datetime.utcnow()` with timezone-aware alternatives
+  - Suppress SQLAlchemy deprecation warnings for cleaner output
+  - Improve future compatibility with Python datetime best practices
+
+## v0.14.1 (2025-07-03)
+
+### Bug Fixes
+
+- **#203**: Constrain fastmcp version to prevent breaking changes
+  ([`827f7cf`](https://github.com/basicmachines-co/basic-memory/commit/827f7cf86e7b84c56e7a43bb83f2e5d84a1ad8b8))
+  - Pin fastmcp to compatible version range to avoid API breaking changes
+  - Ensure stable MCP server functionality across updates
+  - Improve dependency management for production deployments
+
+- **#190**: Fix Problems with MCP integration  
+  ([`bd4f551`](https://github.com/basicmachines-co/basic-memory/commit/bd4f551a5bb0b7b4d3a5b04de70e08987c6ab2f9))
+  - Resolve MCP server initialization and communication issues
+  - Improve error handling and recovery in MCP operations
+  - Enhance stability for AI assistant integrations
+
+### Features
+
+- **Add Cursor IDE integration button** - One-click setup for Cursor IDE users
+  ([`5360005`](https://github.com/basicmachines-co/basic-memory/commit/536000512294d66090bf87abc8014f4dfc284310))
+  - Direct installation button for Cursor IDE in README
+  - Streamlined setup process for Cursor users
+  - Enhanced developer experience for AI-powered coding
+
+- **Add Homebrew installation instructions** - Official Homebrew tap support
+  ([`39f811f`](https://github.com/basicmachines-co/basic-memory/commit/39f811f8b57dd998445ae43537cd492c680b2e11))
+  - Official Homebrew formula in basicmachines-co/basic-memory tap
+  - Simplified installation process for macOS users
+  - Package manager integration for easier dependency management
+
+## v0.14.0 (2025-06-26)
+
+### Features
+
+- **Docker Container Registry Migration** - Switch from Docker Hub to GitHub Container Registry for better security and integration  
+  ([`616c1f0`](https://github.com/basicmachines-co/basic-memory/commit/616c1f0710da59c7098a5f4843d4f017877ff7b2))
+  - Automated Docker image publishing via GitHub Actions CI/CD pipeline
+  - Enhanced container security with GitHub's integrated vulnerability scanning
+  - Streamlined container deployment workflow for production environments
+
+- **Enhanced Search Documentation** - Comprehensive search syntax examples for improved user experience
+  ([`a589f8b`](https://github.com/basicmachines-co/basic-memory/commit/a589f8b894e78cce01eb25656856cfea8785fbbf))
+  - Detailed examples for Boolean search operators (AND, OR, NOT)
+  - Advanced search patterns including phrase matching and field-specific queries
+  - User-friendly documentation for complex search scenarios
+
+- **Cross-Project File Management** - Intelligent move operations with project boundary detection
+  ([`db5ef7d`](https://github.com/basicmachines-co/basic-memory/commit/db5ef7d35cc0894309c7a57b5741c9dd978526d4))
+  - Automatic detection of cross-project move attempts with helpful guidance
+  - Clear error messages when attempting unsupported cross-project operations
+
+### Bug Fixes
+
+- **#184**: Preserve permalinks when editing notes without frontmatter permalinks
+  ([`c2f4b63`](https://github.com/basicmachines-co/basic-memory/commit/c2f4b632cf04921b1a3c2f0d43831b80c519cb31))
+  - Fix permalink preservation during note editing operations
+  - Ensure consistent permalink handling across different note formats
+  - Maintain note identity and searchability during incremental edits
+
+- **#183**: Implement project-specific sync status checks for MCP tools
+  ([`12b5152`](https://github.com/basicmachines-co/basic-memory/commit/12b51522bc953fca117fc5bc01fcb29c6ca7e13c))
+  - Fix sync status reporting to correctly reflect current project state
+  - Resolve inconsistencies where sync status showed global instead of project-specific information
+  - Improve project isolation for sync operations and status reporting
+
+- **#180**: Handle Boolean search syntax with hyphenated terms
+  ([`546e3cd`](https://github.com/basicmachines-co/basic-memory/commit/546e3cd8db98b74f746749d41887f8a213cd0b11))
+  - Fix search parsing issues with hyphenated terms in Boolean queries
+  - Improve search query tokenization for complex term structures
+  - Enhanced search reliability for technical documentation and multi-word concepts
+
+- **#174**: Respect BASIC_MEMORY_HOME environment variable in Docker containers
+  ([`9f1db23`](https://github.com/basicmachines-co/basic-memory/commit/9f1db23c78d4648e2c242ad1ee27eed85e3f3b5d))
+  - Fix Docker container configuration to properly honor custom home directory settings
+  - Improve containerized deployment flexibility with environment variable support
+  - Ensure consistent behavior between local and containerized installations
+
+- **#168**: Scope entity queries by project_id in upsert_entity method
+  ([`2a3adc1`](https://github.com/basicmachines-co/basic-memory/commit/2a3adc109a3e4d7ccd65cae4abf63d9bb2338326))
+  - Fix entity isolation issues in multi-project setups
+  - Prevent cross-project entity conflicts during database operations
+  - Strengthen project boundary enforcement at the database level
+
+- **#166**: Handle None from_entity in Context API RelationSummary
+  ([`8a065c3`](https://github.com/basicmachines-co/basic-memory/commit/8a065c32f4e41613207d29aafc952a56e3a52241))
+  - Fix null pointer exceptions in relation processing
+  - Improve error handling for incomplete relation data
+  - Enhanced stability for knowledge graph traversal operations
+
+- **#164**: Remove log level configuration from mcp_server.run()
+  ([`224e4bf`](https://github.com/basicmachines-co/basic-memory/commit/224e4bf9e4438c44a82ffc21bd1a282fe9087690))
+  - Simplify MCP server startup by removing redundant log level settings
+  - Fix potential logging configuration conflicts
+  - Streamline server initialization process
+
+- **#162**: Ensure permalinks are generated for entities with null permalinks during move operations
+  ([`f506507`](https://github.com/basicmachines-co/basic-memory/commit/f50650763dbd4322c132e4bdc959ce4bf074374b))
+  - Fix move operations for entities without existing permalinks
+  - Automatic permalink generation during file move operations
+  - Maintain database consistency during file reorganization
+
+### Technical Improvements
+
+- **Comprehensive Test Coverage** - Extensive test suites for new features and edge cases
+  - Enhanced test coverage for project-specific sync status functionality
+  - Additional test scenarios for search syntax validation and edge cases
+  - Integration tests for Docker CI workflow and container publishing
+  - Comprehensive move operations testing with project boundary validation
+
+- **Docker CI/CD Pipeline** - Production-ready automated container publishing
+  ([`74847cc`](https://github.com/basicmachines-co/basic-memory/commit/74847cc3807b0c6ed511e0d83e0d560e9f07ec44))
+  - Automated Docker image building and publishing on release
+  - Multi-architecture container support for AMD64 and ARM64 platforms
+  - Integrated security scanning and vulnerability assessments
+  - Streamlined deployment pipeline for production environments
+
+- **Release Process Improvements** - Enhanced automation and quality gates
+  ([`a52ce1c`](https://github.com/basicmachines-co/basic-memory/commit/a52ce1c8605ec2cd450d1f909154172cbc30faa2))
+  - Homebrew formula updates limited to stable releases only
+  - Improved release automation with better quality control
+  - Enhanced CI/CD pipeline reliability and error handling
+
+- **Code Quality Enhancements** - Improved error handling and validation
+  - Better null safety in entity and relation processing
+  - Enhanced project isolation validation throughout the codebase
+  - Improved error messages and user guidance for edge cases
+  - Strengthened database consistency guarantees across operations
+
+### Infrastructure
+
+- **GitHub Container Registry Integration** - Modern container infrastructure
+  - Migration from Docker Hub to GitHub Container Registry (ghcr.io)
+  - Improved security with integrated vulnerability scanning
+  - Better integration with GitHub-based development workflow
+  - Enhanced container versioning and artifact management
+
+- **Enhanced CI/CD Workflows** - Robust automated testing and deployment
+  - Automated Docker image publishing on releases
+  - Comprehensive test coverage validation before deployment
+  - Multi-platform container building and publishing
+  - Integration with GitHub's security and monitoring tools
+
+### Migration Guide
+
+This release includes several behind-the-scenes improvements and fixes. All changes are backward compatible:
+
+- **Docker Users**: Container images now served from `ghcr.io/basicmachines-co/basic-memory` instead of Docker Hub
+- **Search Users**: Enhanced search syntax handling - existing queries continue to work unchanged
+- **Multi-Project Users**: Improved project isolation - all existing projects remain fully functional
+- **All Users**: Enhanced stability and error handling - no breaking changes to existing workflows
+
+### Installation
+
+```bash
+# Latest stable release
+uv tool install basic-memory
+
+# Update existing installation  
+uv tool upgrade basic-memory
+
+# Docker (new registry)
+docker pull ghcr.io/basicmachines-co/basic-memory:latest
+```
+
+## v0.13.7 (2025-06-19)
+
+### Bug Fixes
+
+- **Homebrew Integration** - Automatic Homebrew formula updates
+- **Documentation** - Add git sign-off reminder to development guide
+
+## v0.13.6 (2025-06-18)
+
+### Bug Fixes
+
+- **Custom Entity Types** - Support for custom entity types in write_note
+  ([`7789864`](https://github.com/basicmachines-co/basic-memory/commit/77898644933589c2da9bdd60571d54137a5309ed))
+  - Fixed `entity_type` parameter for `write_note` MCP tool to respect value passed in
+  - Frontmatter `type` field automatically respected when no explicit parameter provided
+  - Maintains backward compatibility with default "note" type
+
+- **#139**: Fix "UNIQUE constraint failed: entity.permalink" database error
+  ([`c6215fd`](https://github.com/basicmachines-co/basic-memory/commit/c6215fd819f9564ead91cf3a950f855241446096))
+  - Implement SQLAlchemy UPSERT strategy to handle permalink conflicts gracefully
+  - Eliminates crashes when creating notes with existing titles in same folders
+  - Seamlessly updates existing entities instead of failing with constraint errors
+
+- **Database Migration Performance** - Eliminate redundant migration initialization
+  ([`84d2aaf`](https://github.com/basicmachines-co/basic-memory/commit/84d2aaf6414dd083af4b0df73f6c8139b63468f6))
+  - Fix duplicate migration calls that slowed system startup
+  - Improve performance with multiple projects (tested with 28+ projects)
+  - Add migration deduplication safeguards with comprehensive test coverage
+
+- **User Experience** - Correct spelling error in continue_conversation prompt
+  ([`b4c26a6`](https://github.com/basicmachines-co/basic-memory/commit/b4c26a613379e6f2ba655efe3d7d8d40c27999e5))
+  - Fix "Chose a folder" → "Choose a folder" in MCP prompt instructions
+  - Improve grammar and clarity in user-facing prompt text
+
+### Documentation
+
+- **Website Updates** - Add new website and community links to README
+  ([`3fdce68`](https://github.com/basicmachines-co/basic-memory/commit/3fdce683d7ad8b6f4855d7138d5ff2136d4c07bc))
+
+- **Project Documentation** - Update README.md and CLAUDE.md with latest project information
+  ([`782cb2d`](https://github.com/basicmachines-co/basic-memory/commit/782cb2df28803482d209135a054e67cc32d7363e))
+
+### Technical Improvements
+
+- **Comprehensive Test Coverage** - Add extensive test suites for new features
+  - Custom entity type validation with 8 new test scenarios
+  - UPSERT behavior testing with edge case coverage
+  - Migration deduplication testing with 6 test scenarios
+  - Database constraint handling validation
+
+- **Code Quality** - Enhanced error handling and validation
+  - Improved SQLAlchemy patterns with modern UPSERT operations
+  - Better conflict resolution strategies for entity management
+  - Strengthened database consistency guarantees
+
+### Performance
+
+- **Database Operations** - Faster startup and improved scalability
+  - Reduced migration overhead for multi-project setups
+  - Optimized conflict resolution for entity creation
+  - Enhanced performance with growing knowledge bases
+
+### Migration Guide
+
+This release includes automatic database improvements. No manual migration required:
+
+- Existing notes and entity types continue working unchanged
+- New `entity_type` parameter is optional and backward compatible
+- Database performance improvements apply automatically
+- All existing MCP tool behavior preserved
+
+### Installation
+
+```bash
+# Latest stable release
+uv tool install basic-memory
+
+# Update existing installation
+uv tool upgrade basic-memory
+```
+
+## v0.13.5 (2025-06-11)
+
+### Bug Fixes
+
+- **MCP Tools**: Renamed `create_project` tool to `create_memory_project` for namespace isolation
+- **Namespace**: Continued namespace isolation effort to prevent conflicts with other MCP servers
+
+### Changes
+
+- Tool functionality remains identical - only the name changed from `create_project` to `create_memory_project`
+- All integration tests updated to use the new tool name
+- Completes namespace isolation for project management tools alongside `list_memory_projects`
+
+## v0.13.4 (2025-06-11)
+
+### Bug Fixes
+
+- **MCP Tools**: Renamed `list_projects` tool to `list_memory_projects` to avoid naming conflicts with other MCP servers
+- **Namespace**: Improved tool naming specificity for better MCP server integration and isolation
+
+### Changes
+
+- Tool functionality remains identical - only the name changed from `list_projects` to `list_memory_projects`
+- All integration tests updated to use the new tool name
+- Better namespace isolation for Basic Memory MCP tools
+
+## v0.13.3 (2025-06-11)
+
+### Bug Fixes
+
+- **Projects**: Fixed case-insensitive project switching where switching succeeded but subsequent operations failed due to session state inconsistency
+- **Config**: Enhanced config manager with case-insensitive project lookup using permalink-based matching
+- **MCP Tools**: Updated project management tools to store canonical project names from database instead of user input
+- **API**: Improved project service to handle both name and permalink lookups consistently
+
+### Technical Improvements
+
+- Added comprehensive case-insensitive project switching test coverage with 5 new integration test scenarios
+- Fixed permalink generation inconsistencies where different case inputs could generate different permalinks
+- Enhanced project URL construction to use permalinks consistently across all API calls
+- Improved error handling and session state management for project operations
+
+### Changes
+
+- Project switching now preserves canonical project names from database in session state
+- All project operations use permalink-based lookups for case-insensitive matching
+- Enhanced test coverage ensures reliable case-insensitive project operations
+
+## v0.13.2 (2025-06-11)
+
+### Features
+
+- **Release Management**: Added automated release management system with version control in `__init__.py`
+- **Automation**: Implemented justfile targets for `release` and `beta` commands with comprehensive quality gates
+- **CI/CD**: Enhanced release process with automatic version updates, git tagging, and GitHub release creation
+
+### Development Experience
+
+- Added `.claude/commands/release/` directory with automation documentation
+- Implemented release validation including lint, type-check, and test execution
+- Streamlined release workflow from manual process to single-command automation
+
+### Technical Improvements
+
+- Updated package version management to use actual version numbers instead of dynamic versioning
+- Added release process documentation and command references
+- Enhanced justfile with comprehensive release automation targets
+
+## v0.13.1 (2025-06-11)
+
+### Bug Fixes
+
+- **CLI**: Fixed  `basic-memory project` project management commands that were  not working in v0.13.0 (#129)
+- **Projects**: Resolved case sensitivity issues when switching between projects that caused "Project not found" errors (#127)
+- **API**: Standardized CLI project command endpoints and improved error handling
+- **Core**: Implemented consistent project name handling using permalinks to avoid case-related conflicts
+
+### Changes
+
+- Renamed `basic-memory project sync` command to `basic-memory project sync-config` for clarity
+- Improved project switching reliability across different case variations
+- Removed redundant server status messages from CLI error outputs
+
 ## v0.13.0 (2025-06-11)
 
 ### Overview

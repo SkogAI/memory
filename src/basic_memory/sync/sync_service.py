@@ -1,7 +1,9 @@
 """Service for syncing files between filesystem and database."""
 
+import asyncio
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -80,6 +82,41 @@ class SyncService:
         self.relation_repository = relation_repository
         self.search_service = search_service
         self.file_service = file_service
+        self._thread_pool = ThreadPoolExecutor(max_workers=app_config.sync_thread_pool_size)
+
+    async def _read_file_async(self, file_path: Path) -> str:
+        """Read file content in thread pool to avoid blocking the event loop."""
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._thread_pool, file_path.read_text, "utf-8")
+
+    async def _compute_checksum_async(self, path: str) -> str:
+        """Compute file checksum in thread pool to avoid blocking the event loop."""
+
+        def _sync_compute_checksum(path_str: str) -> str:
+            # Synchronous version for thread pool execution
+            path_obj = self.file_service.base_path / path_str
+
+            if self.file_service.is_markdown(path_str):
+                content = path_obj.read_text(encoding="utf-8")
+            else:
+                content = path_obj.read_bytes()
+
+            # Use the synchronous version of compute_checksum
+            import hashlib
+
+            if isinstance(content, str):
+                content_bytes = content.encode("utf-8")
+            else:
+                content_bytes = content
+            return hashlib.sha256(content_bytes).hexdigest()
+
+        loop = asyncio.get_event_loop()
+        return await loop.run_in_executor(self._thread_pool, _sync_compute_checksum, path)
+
+    def __del__(self):
+        """Cleanup thread pool when service is destroyed."""
+        if hasattr(self, "_thread_pool"):
+            self._thread_pool.shutdown(wait=False)
 
     async def sync(self, directory: Path, project_name: Optional[str] = None) -> SyncReport:
         """Sync all files with database."""
@@ -289,7 +326,7 @@ class SyncService:
         logger.debug(f"Parsing markdown file, path: {path}, new: {new}")
 
         file_path = self.entity_parser.base_path / path
-        file_content = file_path.read_text(encoding="utf-8")
+        file_content = await self._read_file_async(file_path)
         file_contains_frontmatter = has_frontmatter(file_content)
 
         # entity markdown will always contain front matter, so it can be used up create/update the entity
@@ -326,7 +363,7 @@ class SyncService:
         # After updating relations, we need to compute the checksum again
         # This is necessary for files with wikilinks to ensure consistent checksums
         # after relation processing is complete
-        final_checksum = await self.file_service.compute_checksum(path)
+        final_checksum = await self._compute_checksum_async(path)
 
         # set checksum
         await self.entity_repository.update(entity.id, {"checksum": final_checksum})
@@ -350,15 +387,15 @@ class SyncService:
         Returns:
             Tuple of (entity, checksum)
         """
-        checksum = await self.file_service.compute_checksum(path)
+        checksum = await self._compute_checksum_async(path)
         if new:
             # Generate permalink from path
             await self.entity_service.resolve_permalink(path)
 
             # get file timestamps
             file_stats = self.file_service.file_stats(path)
-            created = datetime.fromtimestamp(file_stats.st_ctime)
-            modified = datetime.fromtimestamp(file_stats.st_mtime)
+            created = datetime.fromtimestamp(file_stats.st_ctime).astimezone()
+            modified = datetime.fromtimestamp(file_stats.st_mtime).astimezone()
 
             # get mime type
             content_type = self.file_service.content_type(path)
@@ -453,6 +490,36 @@ class SyncService:
 
         entity = await self.entity_repository.get_by_file_path(old_path)
         if entity:
+            # Check if destination path is already occupied by another entity
+            existing_at_destination = await self.entity_repository.get_by_file_path(new_path)
+            if existing_at_destination and existing_at_destination.id != entity.id:
+                # Handle the conflict - this could be a file swap or replacement scenario
+                logger.warning(
+                    f"File path conflict detected during move: "
+                    f"entity_id={entity.id} trying to move from '{old_path}' to '{new_path}', "
+                    f"but entity_id={existing_at_destination.id} already occupies '{new_path}'"
+                )
+
+                # Check if this is a file swap (the destination entity is being moved to our old path)
+                # This would indicate a simultaneous move operation
+                old_path_after_swap = await self.entity_repository.get_by_file_path(old_path)
+                if old_path_after_swap and old_path_after_swap.id == existing_at_destination.id:
+                    logger.info(f"Detected file swap between '{old_path}' and '{new_path}'")
+                    # This is a swap scenario - both moves should succeed
+                    # We'll allow this to proceed since the other file has moved out
+                else:
+                    # This is a conflict where the destination is occupied
+                    raise ValueError(
+                        f"Cannot move entity from '{old_path}' to '{new_path}': "
+                        f"destination path is already occupied by another file. "
+                        f"This may be caused by: "
+                        f"1. Conflicting file names with different character encodings, "
+                        f"2. Case sensitivity differences (e.g., 'Finance/' vs 'finance/'), "
+                        f"3. Character conflicts between hyphens in filenames and generated permalinks, "
+                        f"4. Files with similar names containing special characters. "
+                        f"Try renaming one of the conflicting files to resolve this issue."
+                    )
+
             # Update file_path in all cases
             updates = {"file_path": new_path}
 
@@ -477,7 +544,26 @@ class SyncService:
                     f"new_checksum={new_checksum}"
                 )
 
-            updated = await self.entity_repository.update(entity.id, updates)
+            try:
+                updated = await self.entity_repository.update(entity.id, updates)
+            except Exception as e:
+                # Catch any database integrity errors and provide helpful context
+                if "UNIQUE constraint failed" in str(e):
+                    logger.error(
+                        f"Database constraint violation during move: "
+                        f"entity_id={entity.id}, old_path='{old_path}', new_path='{new_path}'"
+                    )
+                    raise ValueError(
+                        f"Cannot complete move from '{old_path}' to '{new_path}': "
+                        f"a database constraint was violated. This usually indicates "
+                        f"a file path or permalink conflict. Please check for: "
+                        f"1. Duplicate file names, "
+                        f"2. Case sensitivity issues (e.g., 'File.md' vs 'file.md'), "
+                        f"3. Character encoding conflicts in file names."
+                    ) from e
+                else:
+                    # Re-raise other exceptions as-is
+                    raise
 
             if updated is None:  # pragma: no cover
                 logger.error(
@@ -499,12 +585,27 @@ class SyncService:
             # update search index
             await self.search_service.index_entity(updated)
 
-    async def resolve_relations(self):
-        """Try to resolve any unresolved relations"""
+    async def resolve_relations(self, entity_id: int | None = None):
+        """Try to resolve unresolved relations.
 
-        unresolved_relations = await self.relation_repository.find_unresolved_relations()
+        Args:
+            entity_id: If provided, only resolve relations for this specific entity.
+                      Otherwise, resolve all unresolved relations in the database.
+        """
 
-        logger.info("Resolving forward references", count=len(unresolved_relations))
+        if entity_id:
+            # Only get unresolved relations for the specific entity
+            unresolved_relations = (
+                await self.relation_repository.find_unresolved_relations_for_entity(entity_id)
+            )
+            logger.info(
+                f"Resolving forward references for entity {entity_id}",
+                count=len(unresolved_relations),
+            )
+        else:
+            # Get all unresolved relations (original behavior)
+            unresolved_relations = await self.relation_repository.find_unresolved_relations()
+            logger.info("Resolving all forward references", count=len(unresolved_relations))
 
         for relation in unresolved_relations:
             logger.trace(
@@ -570,8 +671,8 @@ class SyncService:
                     continue
 
                 path = Path(root) / filename
-                rel_path = str(path.relative_to(directory))
-                checksum = await self.file_service.compute_checksum(rel_path)
+                rel_path = path.relative_to(directory).as_posix()
+                checksum = await self._compute_checksum_async(rel_path)
                 result.files[rel_path] = checksum
                 result.checksums[checksum] = rel_path
 

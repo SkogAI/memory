@@ -592,7 +592,7 @@ async def test_create_with_no_frontmatter(
     created = await entity_service.create_entity_from_markdown(file_path, entity_markdown)
     file_content, _ = await file_service.read_file(created.file_path)
 
-    assert str(file_path) == str(created.file_path)
+    assert file_path.as_posix() == created.file_path
     assert created.title == "Git Workflow Guide"
     assert created.entity_type == "note"
     assert created.permalink is None
@@ -870,14 +870,11 @@ async def test_edit_entity_with_observations_and_relations(
 
 
 @pytest.mark.asyncio
-async def test_create_entity_from_markdown_race_condition_handling(
+async def test_create_entity_from_markdown_with_upsert(
     entity_service: EntityService, file_service: FileService
 ):
-    """Test that create_entity_from_markdown handles race condition with IntegrityError (lines 304-311)."""
-    from unittest.mock import patch
-    from sqlalchemy.exc import IntegrityError
-
-    file_path = Path("test/race-condition.md")
+    """Test that create_entity_from_markdown uses UPSERT approach for conflict resolution."""
+    file_path = Path("test/upsert-test.md")
 
     # Create a mock EntityMarkdown object
     from basic_memory.markdown.schemas import (
@@ -886,7 +883,7 @@ async def test_create_entity_from_markdown_race_condition_handling(
     )
     from datetime import datetime, timezone
 
-    frontmatter = EntityFrontmatter(metadata={"title": "Race Condition Test", "type": "test"})
+    frontmatter = EntityFrontmatter(metadata={"title": "UPSERT Test", "type": "test"})
     markdown = RealEntityMarkdown(
         frontmatter=frontmatter,
         observations=[],
@@ -895,63 +892,26 @@ async def test_create_entity_from_markdown_race_condition_handling(
         modified=datetime.now(timezone.utc),
     )
 
-    # Mock the repository.add to raise IntegrityError on first call, then succeed on second
-    original_add = entity_service.repository.add
+    # Call the method - should succeed without complex exception handling
+    result = await entity_service.create_entity_from_markdown(file_path, markdown)
 
-    call_count = 0
-
-    async def mock_add(*args, **kwargs):
-        nonlocal call_count
-        call_count += 1
-        if call_count == 1:
-            # Simulate race condition - another process created the entity
-            raise IntegrityError("UNIQUE constraint failed: entity.file_path", None, None)
-        else:
-            return await original_add(*args, **kwargs)
-
-    # Mock update method to return a dummy entity
-    async def mock_update(*args, **kwargs):
-        from basic_memory.models import Entity
-        from datetime import datetime, timezone
-
-        return Entity(
-            id=1,
-            title="Race Condition Test",
-            entity_type="test",
-            file_path=str(file_path),
-            permalink="test/race-condition-test",
-            content_type="text/markdown",
-            created_at=datetime.now(timezone.utc),
-            updated_at=datetime.now(timezone.utc),
-        )
-
-    with (
-        patch.object(entity_service.repository, "add", side_effect=mock_add),
-        patch.object(
-            entity_service, "update_entity_and_observations", side_effect=mock_update
-        ) as mock_update_call,
-    ):
-        # Call the method
-        result = await entity_service.create_entity_from_markdown(file_path, markdown)
-
-        # Verify it handled the race condition gracefully
-        assert result is not None
-        assert result.title == "Race Condition Test"
-        assert result.file_path == str(file_path)
-
-        # Verify that update_entity_and_observations was called as fallback
-        mock_update_call.assert_called_once_with(file_path, markdown)
+    # Verify it created the entity successfully using the UPSERT approach
+    assert result is not None
+    assert result.title == "UPSERT Test"
+    assert result.file_path == file_path.as_posix()
+    # create_entity_from_markdown sets checksum to None (incomplete sync)
+    assert result.checksum is None
 
 
 @pytest.mark.asyncio
-async def test_create_entity_from_markdown_integrity_error_reraise(
+async def test_create_entity_from_markdown_error_handling(
     entity_service: EntityService, file_service: FileService
 ):
-    """Test that create_entity_from_markdown re-raises IntegrityError for non-race-condition cases."""
+    """Test that create_entity_from_markdown handles repository errors gracefully."""
     from unittest.mock import patch
-    from sqlalchemy.exc import IntegrityError
+    from basic_memory.services.exceptions import EntityCreationError
 
-    file_path = Path("test/integrity-error.md")
+    file_path = Path("test/error-test.md")
 
     # Create a mock EntityMarkdown object
     from basic_memory.markdown.schemas import (
@@ -960,7 +920,7 @@ async def test_create_entity_from_markdown_integrity_error_reraise(
     )
     from datetime import datetime, timezone
 
-    frontmatter = EntityFrontmatter(metadata={"title": "Integrity Error Test", "type": "test"})
+    frontmatter = EntityFrontmatter(metadata={"title": "Error Test", "type": "test"})
     markdown = RealEntityMarkdown(
         frontmatter=frontmatter,
         observations=[],
@@ -969,16 +929,14 @@ async def test_create_entity_from_markdown_integrity_error_reraise(
         modified=datetime.now(timezone.utc),
     )
 
-    # Mock the repository.add to raise a different IntegrityError (not file_path/permalink constraint)
-    async def mock_add(*args, **kwargs):
-        # Simulate a different constraint violation
-        raise IntegrityError("UNIQUE constraint failed: entity.some_other_field", None, None)
+    # Mock the repository.upsert_entity to raise a general error
+    async def mock_upsert(*args, **kwargs):
+        # Simulate a general database error
+        raise Exception("Database connection failed")
 
-    with patch.object(entity_service.repository, "add", side_effect=mock_add):
-        # Should re-raise the IntegrityError since it's not a file_path/permalink constraint
-        with pytest.raises(
-            IntegrityError, match="UNIQUE constraint failed: entity.some_other_field"
-        ):
+    with patch.object(entity_service.repository, "upsert_entity", side_effect=mock_upsert):
+        # Should wrap the error in EntityCreationError
+        with pytest.raises(EntityCreationError, match="Failed to create entity"):
             await entity_service.create_entity_from_markdown(file_path, markdown)
 
 
@@ -1770,3 +1728,69 @@ async def test_move_entity_with_complex_observations(
     assert "Branch Strategy" in relation_targets
     assert "Multiple" in relation_targets
     assert "Links" in relation_targets
+
+
+@pytest.mark.asyncio
+async def test_move_entity_with_null_permalink_generates_permalink(
+    entity_service: EntityService,
+    project_config: ProjectConfig,
+    entity_repository: EntityRepository,
+):
+    """Test that moving entity with null permalink generates a new permalink automatically.
+
+    This tests the fix for issue #155 where entities with null permalinks from the database
+    migration would fail validation when being moved. The fix ensures that entities with
+    null permalinks get a generated permalink during move operations, regardless of the
+    update_permalinks_on_move setting.
+    """
+    # Create entity through direct database insertion to simulate migrated entity with null permalink
+    from datetime import datetime, timezone
+
+    # Create an entity with null permalink directly in database (simulating migrated data)
+    entity_data = {
+        "title": "Test Entity",
+        "file_path": "test/null-permalink-entity.md",
+        "entity_type": "note",
+        "content_type": "text/markdown",
+        "permalink": None,  # This is the key - null permalink from migration
+        "created_at": datetime.now(timezone.utc),
+        "updated_at": datetime.now(timezone.utc),
+    }
+
+    # Create the entity directly in database
+    created_entity = await entity_repository.create(entity_data)
+    assert created_entity.permalink is None
+
+    # Create the physical file
+    file_path = project_config.home / created_entity.file_path
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text("# Test Entity\n\nContent here.")
+
+    # Configure move without permalink updates (the default setting that previously triggered the bug)
+    app_config = BasicMemoryConfig(update_permalinks_on_move=False)
+
+    # Move entity - this should now succeed and generate a permalink
+    moved_entity = await entity_service.move_entity(
+        identifier=created_entity.title,  # Use title since permalink is None
+        destination_path="moved/test-entity.md",
+        project_config=project_config,
+        app_config=app_config,
+    )
+
+    # Verify the move succeeded and a permalink was generated
+    assert moved_entity is not None
+    assert moved_entity.file_path == "moved/test-entity.md"
+    assert moved_entity.permalink is not None
+    assert moved_entity.permalink != ""
+
+    # Verify the moved entity can be used to create an EntityResponse without validation errors
+    from basic_memory.schemas.response import EntityResponse
+
+    response = EntityResponse.model_validate(moved_entity)
+    assert response.permalink == moved_entity.permalink
+
+    # Verify the physical file was moved
+    old_path = project_config.home / "test/null-permalink-entity.md"
+    new_path = project_config.home / "moved/test-entity.md"
+    assert not old_path.exists()
+    assert new_path.exists()

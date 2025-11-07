@@ -1,9 +1,12 @@
 """MCP server command with streamable HTTP transport."""
 
 import asyncio
+import os
 import typer
+from typing import Optional
 
 from basic_memory.cli.app import app
+from basic_memory.config import ConfigManager
 
 # Import mcp instance
 from basic_memory.mcp.server import mcp as mcp_server  # pragma: no cover
@@ -14,6 +17,8 @@ import basic_memory.mcp.tools  # noqa: F401  # pragma: no cover
 # Import prompts to register them
 import basic_memory.mcp.prompts  # noqa: F401  # pragma: no cover
 from loguru import logger
+import threading
+from basic_memory.services.initialization import initialize_file_sync
 
 
 @app.command()
@@ -24,6 +29,7 @@ def mcp(
     ),
     port: int = typer.Option(8000, help="Port for HTTP transports"),
     path: str = typer.Option("/mcp", help="Path prefix for streamable-http transport"),
+    project: Optional[str] = typer.Option(None, help="Restrict MCP server to single project"),
 ):  # pragma: no cover
     """Run the MCP server with configurable transport options.
 
@@ -34,25 +40,19 @@ def mcp(
     - sse: Server-Sent Events (for compatibility with existing clients)
     """
 
-    # Check if OAuth is enabled
-    import os
+    # Validate and set project constraint if specified
+    if project:
+        config_manager = ConfigManager()
+        project_name, _ = config_manager.get_project(project)
+        if not project_name:
+            typer.echo(f"No project found named: {project}", err=True)
+            raise typer.Exit(1)
 
-    auth_enabled = os.getenv("FASTMCP_AUTH_ENABLED", "false").lower() == "true"
-    if auth_enabled:
-        logger.info("OAuth authentication is ENABLED")
-        logger.info(f"Issuer URL: {os.getenv('FASTMCP_AUTH_ISSUER_URL', 'http://localhost:8000')}")
-        if os.getenv("FASTMCP_AUTH_REQUIRED_SCOPES"):
-            logger.info(f"Required scopes: {os.getenv('FASTMCP_AUTH_REQUIRED_SCOPES')}")
-    else:
-        logger.info("OAuth authentication is DISABLED")
+        # Set env var with validated project name
+        os.environ["BASIC_MEMORY_MCP_PROJECT"] = project_name
+        logger.info(f"MCP server constrained to project: {project_name}")
 
-    from basic_memory.config import app_config
-    from basic_memory.services.initialization import initialize_file_sync
-
-    # Start the MCP server with the specified transport
-
-    # Use unified thread-based sync approach for both transports
-    import threading
+    app_config = ConfigManager().config
 
     def run_file_sync():
         """Run file sync in a separate thread with its own event loop."""
@@ -85,4 +85,5 @@ def mcp(
             host=host,
             port=port,
             path=path,
+            log_level="INFO",
         )

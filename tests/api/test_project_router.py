@@ -1,9 +1,54 @@
 """Tests for the project router API endpoints."""
 
-import json
-from unittest.mock import patch
-
 import pytest
+
+from basic_memory.schemas.project_info import ProjectItem
+
+
+@pytest.mark.asyncio
+async def test_get_project_item(test_graph, client, project_config, test_project, project_url):
+    """Test the project item endpoint returns correctly structured data."""
+    # Set up some test data in the database
+
+    # Call the endpoint
+    response = await client.get(f"{project_url}/project/item")
+
+    # Verify response
+    assert response.status_code == 200
+    project_info = ProjectItem.model_validate(response.json())
+    assert project_info.name == test_project.name
+    assert project_info.path == test_project.path
+    assert project_info.is_default == test_project.is_default
+
+
+@pytest.mark.asyncio
+async def test_get_project_item_not_found(
+    test_graph, client, project_config, test_project, project_url
+):
+    """Test the project item endpoint returns correctly structured data."""
+    # Set up some test data in the database
+
+    # Call the endpoint
+    response = await client.get("/not-found/project/item")
+
+    # Verify response
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_default_project(test_graph, client, project_config, test_project, project_url):
+    """Test the default project item endpoint returns the default project."""
+    # Set up some test data in the database
+
+    # Call the endpoint
+    response = await client.get("/projects/default")
+
+    # Verify response
+    assert response.status_code == 200
+    project_info = ProjectItem.model_validate(response.json())
+    assert project_info.name == test_project.name
+    assert project_info.path == test_project.path
+    assert project_info.is_default == test_project.is_default
 
 
 @pytest.mark.asyncio
@@ -74,40 +119,6 @@ async def test_get_project_info_content(test_graph, client, project_config, proj
 
     # Check that entity types include 'test'
     assert "test" in stats["entity_types"] or "entity" in stats["entity_types"]
-
-
-@pytest.mark.asyncio
-async def test_get_project_info_watch_status(test_graph, client, project_config, project_url):
-    """Test that project-info correctly handles watch status."""
-    # Create a mock watch status file
-    mock_watch_status = {
-        "running": True,
-        "start_time": "2025-03-05T18:00:42.752435",
-        "pid": 7321,
-        "error_count": 0,
-        "last_error": None,
-        "last_scan": "2025-03-05T19:59:02.444416",
-        "synced_files": 6,
-        "recent_events": [],
-    }
-
-    # Mock the Path.exists and Path.read_text methods
-    with (
-        patch("pathlib.Path.exists", return_value=True),
-        patch("pathlib.Path.read_text", return_value=json.dumps(mock_watch_status)),
-    ):
-        # Call the endpoint
-        response = await client.get(f"{project_url}/project/info")
-
-        # Verify response
-        assert response.status_code == 200
-        data = response.json()
-
-        # Check that watch status is included
-        assert data["system"]["watch_status"] is not None
-        assert data["system"]["watch_status"]["running"] is True
-        assert data["system"]["watch_status"]["pid"] == 7321
-        assert data["system"]["watch_status"]["synced_files"] == 6
 
 
 @pytest.mark.asyncio
@@ -196,3 +207,238 @@ async def test_set_default_project_endpoint(test_config, client, project_service
 
     # Verify it's actually set as default
     assert project_service.default_project == test_project_name
+
+
+@pytest.mark.asyncio
+async def test_update_project_path_endpoint(
+    test_config, client, project_service, project_url, tmp_path
+):
+    """Test the update project endpoint for changing project path."""
+    # Create a test project to update
+    test_project_name = "test-update-project"
+    old_path = (tmp_path / "old-location").as_posix()
+    new_path = (tmp_path / "new-location").as_posix()
+
+    await project_service.add_project(test_project_name, old_path)
+
+    try:
+        # Verify initial state
+        project = await project_service.get_project(test_project_name)
+        assert project is not None
+        assert project.path == old_path
+
+        # Update the project path
+        response = await client.patch(
+            f"{project_url}/project/{test_project_name}", json={"path": new_path}
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        data = response.json()
+
+        # Check response structure
+        assert "message" in data
+        assert "status" in data
+        assert data["status"] == "success"
+        assert "old_project" in data
+        assert "new_project" in data
+
+        # Check old project data
+        assert data["old_project"]["name"] == test_project_name
+        assert data["old_project"]["path"] == old_path
+
+        # Check new project data
+        assert data["new_project"]["name"] == test_project_name
+        assert data["new_project"]["path"] == new_path
+
+        # Verify project was actually updated in database
+        updated_project = await project_service.get_project(test_project_name)
+        assert updated_project is not None
+        assert updated_project.path == new_path
+
+    finally:
+        # Clean up
+        try:
+            await project_service.remove_project(test_project_name)
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_update_project_is_active_endpoint(test_config, client, project_service, project_url):
+    """Test the update project endpoint for changing is_active status."""
+    # Create a test project to update
+    test_project_name = "test-update-active-project"
+    test_path = "/tmp/test-update-active"
+
+    await project_service.add_project(test_project_name, test_path)
+
+    try:
+        # Update the project is_active status
+        response = await client.patch(
+            f"{project_url}/project/{test_project_name}", json={"is_active": False}
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        data = response.json()
+
+        # Check response structure
+        assert "message" in data
+        assert "status" in data
+        assert data["status"] == "success"
+        assert f"Project '{test_project_name}' updated successfully" == data["message"]
+
+    finally:
+        # Clean up
+        try:
+            await project_service.remove_project(test_project_name)
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_update_project_both_params_endpoint(
+    test_config, client, project_service, project_url, tmp_path
+):
+    """Test the update project endpoint with both path and is_active parameters."""
+    # Create a test project to update
+    test_project_name = "test-update-both-project"
+    old_path = (tmp_path / "old-location").as_posix()
+    new_path = (tmp_path / "new-location").as_posix()
+
+    await project_service.add_project(test_project_name, old_path)
+
+    try:
+        # Update both path and is_active (path should take precedence)
+        response = await client.patch(
+            f"{project_url}/project/{test_project_name}",
+            json={"path": new_path, "is_active": False},
+        )
+
+        # Verify response
+        assert response.status_code == 200
+        data = response.json()
+
+        # Check that path update was performed (takes precedence)
+        assert data["new_project"]["path"] == new_path
+
+        # Verify project was actually updated in database
+        updated_project = await project_service.get_project(test_project_name)
+        assert updated_project is not None
+        assert updated_project.path == new_path
+
+    finally:
+        # Clean up
+        try:
+            await project_service.remove_project(test_project_name)
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_update_project_nonexistent_endpoint(client, project_url):
+    """Test the update project endpoint with a nonexistent project."""
+    # Try to update a project that doesn't exist
+    response = await client.patch(
+        f"{project_url}/project/nonexistent-project", json={"path": "/tmp/new-path"}
+    )
+
+    # Should return 400 error
+    assert response.status_code == 400
+    data = response.json()
+    assert "detail" in data
+    assert "not found in configuration" in data["detail"]
+
+
+@pytest.mark.asyncio
+async def test_update_project_relative_path_error_endpoint(
+    test_config, client, project_service, project_url
+):
+    """Test the update project endpoint with relative path (should fail)."""
+    # Create a test project to update
+    test_project_name = "test-update-relative-project"
+    test_path = "/tmp/test-update-relative"
+
+    await project_service.add_project(test_project_name, test_path)
+
+    try:
+        # Try to update with relative path
+        response = await client.patch(
+            f"{project_url}/project/{test_project_name}", json={"path": "./relative-path"}
+        )
+
+        # Should return 400 error
+        assert response.status_code == 400
+        data = response.json()
+        assert "detail" in data
+        assert "Path must be absolute" in data["detail"]
+
+    finally:
+        # Clean up
+        try:
+            await project_service.remove_project(test_project_name)
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_update_project_no_params_endpoint(test_config, client, project_service, project_url):
+    """Test the update project endpoint with no parameters (should fail)."""
+    # Create a test project to update
+    test_project_name = "test-update-no-params-project"
+    test_path = "/tmp/test-update-no-params"
+
+    await project_service.add_project(test_project_name, test_path)
+    proj_info = await project_service.get_project(test_project_name)
+    assert proj_info.name == test_project_name
+    # On Windows the path is prepended with a drive letter
+    assert test_path in proj_info.path
+
+    try:
+        # Try to update with no parameters
+        response = await client.patch(f"{project_url}/project/{test_project_name}", json={})
+
+        # Should return 200 (no-op)
+        assert response.status_code == 200
+        proj_info = await project_service.get_project(test_project_name)
+        assert proj_info.name == test_project_name
+        # On Windows the path is prepended with a drive letter
+        assert test_path in proj_info.path
+
+    finally:
+        # Clean up
+        try:
+            await project_service.remove_project(test_project_name)
+        except Exception:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_update_project_empty_path_endpoint(
+    test_config, client, project_service, project_url
+):
+    """Test the update project endpoint with empty path parameter."""
+    # Create a test project to update
+    test_project_name = "test-update-empty-path-project"
+    test_path = "/tmp/test-update-empty-path"
+
+    await project_service.add_project(test_project_name, test_path)
+
+    try:
+        # Try to update with empty/null path - should be treated as no path update
+        response = await client.patch(
+            f"{project_url}/project/{test_project_name}", json={"path": None, "is_active": True}
+        )
+
+        # Should succeed and perform is_active update
+        assert response.status_code == 200
+        data = response.json()
+        assert data["status"] == "success"
+
+    finally:
+        # Clean up
+        try:
+            await project_service.remove_project(test_project_name)
+        except Exception:
+            pass

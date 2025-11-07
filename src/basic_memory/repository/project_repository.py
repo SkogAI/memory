@@ -46,7 +46,7 @@ class ProjectRepository(Repository[Project]):
         Args:
             path: Path to the project directory (will be converted to string internally)
         """
-        query = self.select().where(Project.path == str(path))
+        query = self.select().where(Project.path == Path(path).as_posix())
         return await self.find_one(query)
 
     async def get_default_project(self) -> Optional[Project]:
@@ -83,3 +83,21 @@ class ProjectRepository(Repository[Project]):
                 await session.flush()
                 return target_project
             return None  # pragma: no cover
+
+    async def update_path(self, project_id: int, new_path: str) -> Optional[Project]:
+        """Update project path.
+
+        Args:
+            project_id: ID of the project to update
+            new_path: New filesystem path for the project
+
+        Returns:
+            The updated project if found, None otherwise
+        """
+        async with db.scoped_session(self.session_maker) as session:
+            project = await self.select_by_id(session, project_id)
+            if project:
+                project.path = new_path
+                await session.flush()
+                return project
+            return None

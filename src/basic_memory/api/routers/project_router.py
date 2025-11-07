@@ -1,5 +1,6 @@
 """Router for project management."""
 
+import os
 from fastapi import APIRouter, HTTPException, Path, Body
 from typing import Optional
 
@@ -13,6 +14,7 @@ from basic_memory.schemas.project_info import (
 )
 
 # Router for resources in a specific project
+# The ProjectPathDep is used in the path as a prefix, so the request path is like /{project}/project/info
 project_router = APIRouter(prefix="/project", tags=["project"])
 
 # Router for managing project resources
@@ -28,44 +30,70 @@ async def get_project_info(
     return await project_service.get_project_info(project)
 
 
+@project_router.get("/item", response_model=ProjectItem)
+async def get_project(
+    project_service: ProjectServiceDep,
+    project: ProjectPathDep,
+) -> ProjectItem:
+    """Get bassic info about the specified Basic Memory project."""
+    found_project = await project_service.get_project(project)
+    if not found_project:
+        raise HTTPException(
+            status_code=404, detail=f"Project: '{project}' does not exist"
+        )  # pragma: no cover
+
+    return ProjectItem(
+        name=found_project.name,
+        path=found_project.path,
+        is_default=found_project.is_default or False,
+    )
+
+
 # Update a project
 @project_router.patch("/{name}", response_model=ProjectStatusResponse)
 async def update_project(
     project_service: ProjectServiceDep,
-    project_name: str = Path(..., description="Name of the project to update"),
-    path: Optional[str] = Body(None, description="New path for the project"),
+    name: str = Path(..., description="Name of the project to update"),
+    path: Optional[str] = Body(None, description="New absolute path for the project"),
     is_active: Optional[bool] = Body(None, description="Status of the project (active/inactive)"),
 ) -> ProjectStatusResponse:
     """Update a project's information in configuration and database.
 
     Args:
-        project_name: The name of the project to update
-        path: Optional new path for the project
+        name: The name of the project to update
+        path: Optional new absolute path for the project
         is_active: Optional status update for the project
 
     Returns:
         Response confirming the project was updated
     """
-    try:  # pragma: no cover
+    try:
+        # Validate that path is absolute if provided
+        if path and not os.path.isabs(path):
+            raise HTTPException(status_code=400, detail="Path must be absolute")
+
         # Get original project info for the response
         old_project_info = ProjectItem(
-            name=project_name,
-            path=project_service.projects.get(project_name, ""),
+            name=name,
+            path=project_service.projects.get(name, ""),
         )
 
-        await project_service.update_project(project_name, updated_path=path, is_active=is_active)
+        if path:
+            await project_service.move_project(name, path)
+        elif is_active is not None:
+            await project_service.update_project(name, is_active=is_active)
 
         # Get updated project info
-        updated_path = path if path else project_service.projects.get(project_name, "")
+        updated_path = path if path else project_service.projects.get(name, "")
 
         return ProjectStatusResponse(
-            message=f"Project '{project_name}' updated successfully",
+            message=f"Project '{name}' updated successfully",
             status="success",
-            default=(project_name == project_service.default_project),
+            default=(name == project_service.default_project),
             old_project=old_project_info,
-            new_project=ProjectItem(name=project_name, path=updated_path),
+            new_project=ProjectItem(name=name, path=updated_path),
         )
-    except ValueError as e:  # pragma: no cover
+    except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
 
@@ -207,6 +235,27 @@ async def set_default_project(
         )
     except ValueError as e:  # pragma: no cover
         raise HTTPException(status_code=400, detail=str(e))
+
+
+# Get the default project
+@project_resource_router.get("/default", response_model=ProjectItem)
+async def get_default_project(
+    project_service: ProjectServiceDep,
+) -> ProjectItem:
+    """Get the default project.
+
+    Returns:
+        Response with project default information
+    """
+    # Get the old default project
+    default_name = project_service.default_project
+    default_project = await project_service.get_project(default_name)
+    if not default_project:  # pragma: no cover
+        raise HTTPException(  # pragma: no cover
+            status_code=404, detail=f"Default Project: '{default_name}' does not exist"
+        )
+
+    return ProjectItem(name=default_project.name, path=default_project.path, is_default=True)
 
 
 # Synchronize projects between config and database

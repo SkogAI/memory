@@ -7,7 +7,7 @@ from typing import Annotated
 
 import typer
 from basic_memory.cli.app import import_app
-from basic_memory.config import config
+from basic_memory.config import get_project_config
 from basic_memory.importers.memory_json_importer import MemoryJsonImporter
 from basic_memory.markdown import EntityParser, MarkdownProcessor
 from loguru import logger
@@ -19,6 +19,7 @@ console = Console()
 
 async def get_markdown_processor() -> MarkdownProcessor:
     """Get MarkdownProcessor instance."""
+    config = get_project_config()
     entity_parser = EntityParser(config.home)
     return MarkdownProcessor(entity_parser)
 
@@ -38,14 +39,13 @@ def memory_json(
     1. Read entities and relations from the JSON file
     2. Create markdown files for each entity
     3. Include outgoing relations in each entity's markdown
-
-    After importing, run 'basic-memory sync' to index the new files.
     """
 
     if not json_path.exists():
         typer.echo(f"Error: File not found: {json_path}", err=True)
         raise typer.Exit(1)
 
+    config = get_project_config()
     try:
         # Get markdown processor
         markdown_processor = asyncio.run(get_markdown_processor())
@@ -74,12 +74,11 @@ def memory_json(
             Panel(
                 f"[green]Import complete![/green]\n\n"
                 f"Created {result.entities} entities\n"
-                f"Added {result.relations} relations",
+                f"Added {result.relations} relations\n"
+                f"Skipped {result.skipped_entities} entities\n",
                 expand=False,
             )
         )
-
-        console.print("\nRun 'basic-memory sync' to index the new files.")
 
     except Exception as e:
         logger.error("Import failed")

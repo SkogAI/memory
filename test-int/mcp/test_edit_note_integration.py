@@ -9,7 +9,7 @@ from fastmcp import Client
 
 
 @pytest.mark.asyncio
-async def test_edit_note_append_operation(mcp_server, app):
+async def test_edit_note_append_operation(mcp_server, app, test_project):
     """Test appending content to an existing note."""
 
     async with Client(mcp_server) as client:
@@ -17,6 +17,7 @@ async def test_edit_note_append_operation(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Append Test Note",
                 "folder": "test",
                 "content": "# Append Test Note\n\nOriginal content here.",
@@ -28,6 +29,7 @@ async def test_edit_note_append_operation(mcp_server, app):
         edit_result = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "Append Test Note",
                 "operation": "append",
                 "content": "\n\n## New Section\n\nThis content was appended.",
@@ -35,8 +37,8 @@ async def test_edit_note_append_operation(mcp_server, app):
         )
 
         # Should return successful edit summary
-        assert len(edit_result) == 1
-        edit_text = edit_result[0].text
+        assert len(edit_result.content) == 1
+        edit_text = edit_result.content[0].text
         assert "Edited note (append)" in edit_text
         assert "Added 5 lines to end of note" in edit_text
         assert "test/append-test-note" in edit_text
@@ -45,18 +47,19 @@ async def test_edit_note_append_operation(mcp_server, app):
         read_result = await client.call_tool(
             "read_note",
             {
+                "project": test_project.name,
                 "identifier": "Append Test Note",
             },
         )
 
-        content = read_result[0].text
+        content = read_result.content[0].text
         assert "Original content here." in content
         assert "## New Section" in content
         assert "This content was appended." in content
 
 
 @pytest.mark.asyncio
-async def test_edit_note_prepend_operation(mcp_server, app):
+async def test_edit_note_prepend_operation(mcp_server, app, test_project):
     """Test prepending content to an existing note."""
 
     async with Client(mcp_server) as client:
@@ -64,6 +67,7 @@ async def test_edit_note_prepend_operation(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Prepend Test Note",
                 "folder": "test",
                 "content": "# Prepend Test Note\n\nExisting content.",
@@ -75,6 +79,7 @@ async def test_edit_note_prepend_operation(mcp_server, app):
         edit_result = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "test/prepend-test-note",
                 "operation": "prepend",
                 "content": "## Important Update\n\nThis was added at the top.\n\n",
@@ -82,8 +87,8 @@ async def test_edit_note_prepend_operation(mcp_server, app):
         )
 
         # Should return successful edit summary
-        assert len(edit_result) == 1
-        edit_text = edit_result[0].text
+        assert len(edit_result.content) == 1
+        edit_text = edit_result.content[0].text
         assert "Edited note (prepend)" in edit_text
         assert "Added 5 lines to beginning of note" in edit_text
 
@@ -91,11 +96,12 @@ async def test_edit_note_prepend_operation(mcp_server, app):
         read_result = await client.call_tool(
             "read_note",
             {
+                "project": test_project.name,
                 "identifier": "test/prepend-test-note",
             },
         )
 
-        content = read_result[0].text
+        content = read_result.content[0].text
         assert "## Important Update" in content
         assert "This was added at the top." in content
         assert "Existing content." in content
@@ -106,7 +112,7 @@ async def test_edit_note_prepend_operation(mcp_server, app):
 
 
 @pytest.mark.asyncio
-async def test_edit_note_find_replace_operation(mcp_server, app):
+async def test_edit_note_find_replace_operation(mcp_server, app, test_project):
     """Test find and replace operation on an existing note."""
 
     async with Client(mcp_server) as client:
@@ -114,6 +120,7 @@ async def test_edit_note_find_replace_operation(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Find Replace Test",
                 "folder": "test",
                 "content": """# Find Replace Test
@@ -134,6 +141,7 @@ v1.0.0 introduces new features.""",
         edit_result = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "Find Replace Test",
                 "operation": "find_replace",
                 "content": "v1.2.0",
@@ -143,8 +151,8 @@ v1.0.0 introduces new features.""",
         )
 
         # Should return successful edit summary
-        assert len(edit_result) == 1
-        edit_text = edit_result[0].text
+        assert len(edit_result.content) == 1
+        edit_text = edit_result.content[0].text
         assert "Edited note (find_replace)" in edit_text
         assert "Find and replace operation completed" in edit_text
 
@@ -152,18 +160,19 @@ v1.0.0 introduces new features.""",
         read_result = await client.call_tool(
             "read_note",
             {
+                "project": test_project.name,
                 "identifier": "Find Replace Test",
             },
         )
 
-        content = read_result[0].text
+        content = read_result.content[0].text
         assert "v1.2.0" in content
         assert "v1.0.0" not in content  # Should be completely replaced
         assert content.count("v1.2.0") == 3  # Should have exactly 3 occurrences
 
 
 @pytest.mark.asyncio
-async def test_edit_note_replace_section_operation(mcp_server, app):
+async def test_edit_note_replace_section_operation(mcp_server, app, test_project):
     """Test replacing content under a specific section header."""
 
     async with Client(mcp_server) as client:
@@ -171,6 +180,7 @@ async def test_edit_note_replace_section_operation(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Section Replace Test",
                 "folder": "test",
                 "content": """# Section Replace Test
@@ -192,6 +202,7 @@ Some future work notes.""",
         edit_result = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "test/section-replace-test",
                 "operation": "replace_section",
                 "content": """New implementation approach using microservices.
@@ -206,8 +217,8 @@ All services communicate via message queues.""",
         )
 
         # Should return successful edit summary
-        assert len(edit_result) == 1
-        edit_text = edit_result[0].text
+        assert len(edit_result.content) == 1
+        edit_text = edit_result.content[0].text
         assert "Edited note (replace_section)" in edit_text
         assert "Replaced content under section '## Implementation'" in edit_text
 
@@ -215,11 +226,12 @@ All services communicate via message queues.""",
         read_result = await client.call_tool(
             "read_note",
             {
+                "project": test_project.name,
                 "identifier": "Section Replace Test",
             },
         )
 
-        content = read_result[0].text
+        content = read_result.content[0].text
         assert "New implementation approach using microservices" in content
         assert "Old implementation details here" not in content
         assert "Service A handles authentication" in content
@@ -229,7 +241,7 @@ All services communicate via message queues.""",
 
 
 @pytest.mark.asyncio
-async def test_edit_note_with_observations_and_relations(mcp_server, app):
+async def test_edit_note_with_observations_and_relations(mcp_server, app, test_project):
     """Test editing a note that has observations and relations, and verify they're updated."""
 
     async with Client(mcp_server) as client:
@@ -254,6 +266,7 @@ Current endpoints include user management."""
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "API Documentation",
                 "folder": "docs",
                 "content": complex_content,
@@ -275,6 +288,7 @@ Current endpoints include user management."""
         edit_result = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "API Documentation",
                 "operation": "append",
                 "content": new_content,
@@ -282,8 +296,8 @@ Current endpoints include user management."""
         )
 
         # Should return edit summary with observation and relation counts
-        assert len(edit_result) == 1
-        edit_text = edit_result[0].text
+        assert len(edit_result.content) == 1
+        edit_text = edit_result.content[0].text
         assert "Edited note (append)" in edit_text
         assert "## Observations" in edit_text
         assert "## Relations" in edit_text
@@ -297,17 +311,18 @@ Current endpoints include user management."""
         read_result = await client.call_tool(
             "read_note",
             {
+                "project": test_project.name,
                 "identifier": "API Documentation",
             },
         )
 
-        content = read_result[0].text
+        content = read_result.content[0].text
         assert "Added payment processing endpoints" in content
         assert "integrates_with [[Payment Gateway]]" in content
 
 
 @pytest.mark.asyncio
-async def test_edit_note_error_handling_note_not_found(mcp_server, app):
+async def test_edit_note_error_handling_note_not_found(mcp_server, app, test_project):
     """Test error handling when trying to edit a non-existent note."""
 
     async with Client(mcp_server) as client:
@@ -315,6 +330,7 @@ async def test_edit_note_error_handling_note_not_found(mcp_server, app):
         edit_result = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "Non-existent Note",
                 "operation": "append",
                 "content": "Some content to add",
@@ -322,15 +338,15 @@ async def test_edit_note_error_handling_note_not_found(mcp_server, app):
         )
 
         # Should return helpful error message
-        assert len(edit_result) == 1
-        error_text = edit_result[0].text
+        assert len(edit_result.content) == 1
+        error_text = edit_result.content[0].text
         assert "Edit Failed" in error_text
         assert "Non-existent Note" in error_text
         assert "search_notes(" in error_text
 
 
 @pytest.mark.asyncio
-async def test_edit_note_error_handling_text_not_found(mcp_server, app):
+async def test_edit_note_error_handling_text_not_found(mcp_server, app, test_project):
     """Test error handling when find_text is not found in the note."""
 
     async with Client(mcp_server) as client:
@@ -338,6 +354,7 @@ async def test_edit_note_error_handling_text_not_found(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Error Test Note",
                 "folder": "test",
                 "content": "# Error Test Note\n\nThis note has specific content.",
@@ -349,6 +366,7 @@ async def test_edit_note_error_handling_text_not_found(mcp_server, app):
         edit_result = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "Error Test Note",
                 "operation": "find_replace",
                 "content": "replacement text",
@@ -357,8 +375,8 @@ async def test_edit_note_error_handling_text_not_found(mcp_server, app):
         )
 
         # Should return helpful error message
-        assert len(edit_result) == 1
-        error_text = edit_result[0].text
+        assert len(edit_result.content) == 1
+        error_text = edit_result.content[0].text
         assert "Edit Failed - Text Not Found" in error_text
         assert "non-existent text" in error_text
         assert "Error Test Note" in error_text
@@ -366,7 +384,7 @@ async def test_edit_note_error_handling_text_not_found(mcp_server, app):
 
 
 @pytest.mark.asyncio
-async def test_edit_note_error_handling_wrong_replacement_count(mcp_server, app):
+async def test_edit_note_error_handling_wrong_replacement_count(mcp_server, app, test_project):
     """Test error handling when expected_replacements doesn't match actual occurrences."""
 
     async with Client(mcp_server) as client:
@@ -374,6 +392,7 @@ async def test_edit_note_error_handling_wrong_replacement_count(mcp_server, app)
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Count Test Note",
                 "folder": "test",
                 "content": """# Count Test Note
@@ -389,6 +408,7 @@ Final test of the content.""",
         edit_result = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "Count Test Note",
                 "operation": "find_replace",
                 "content": "example",
@@ -398,8 +418,8 @@ Final test of the content.""",
         )
 
         # Should return helpful error message about count mismatch
-        assert len(edit_result) == 1
-        error_text = edit_result[0].text
+        assert len(edit_result.content) == 1
+        error_text = edit_result.content[0].text
         assert "Edit Failed - Wrong Replacement Count" in error_text
         assert "Expected 5 occurrences" in error_text
         assert "test" in error_text
@@ -407,7 +427,7 @@ Final test of the content.""",
 
 
 @pytest.mark.asyncio
-async def test_edit_note_invalid_operation(mcp_server, app):
+async def test_edit_note_invalid_operation(mcp_server, app, test_project):
     """Test error handling for invalid operation parameter."""
 
     async with Client(mcp_server) as client:
@@ -415,6 +435,7 @@ async def test_edit_note_invalid_operation(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Invalid Op Test",
                 "folder": "test",
                 "content": "# Invalid Op Test\n\nSome content.",
@@ -427,6 +448,7 @@ async def test_edit_note_invalid_operation(mcp_server, app):
             await client.call_tool(
                 "edit_note",
                 {
+                    "project": test_project.name,
                     "identifier": "Invalid Op Test",
                     "operation": "invalid_operation",
                     "content": "Some content",
@@ -440,7 +462,7 @@ async def test_edit_note_invalid_operation(mcp_server, app):
 
 
 @pytest.mark.asyncio
-async def test_edit_note_missing_required_parameters(mcp_server, app):
+async def test_edit_note_missing_required_parameters(mcp_server, app, test_project):
     """Test error handling when required parameters are missing."""
 
     async with Client(mcp_server) as client:
@@ -448,6 +470,7 @@ async def test_edit_note_missing_required_parameters(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Param Test Note",
                 "folder": "test",
                 "content": "# Param Test Note\n\nContent here.",
@@ -460,6 +483,7 @@ async def test_edit_note_missing_required_parameters(mcp_server, app):
             await client.call_tool(
                 "edit_note",
                 {
+                    "project": test_project.name,
                     "identifier": "Param Test Note",
                     "operation": "find_replace",
                     "content": "replacement",
@@ -473,7 +497,7 @@ async def test_edit_note_missing_required_parameters(mcp_server, app):
 
 
 @pytest.mark.asyncio
-async def test_edit_note_special_characters_in_content(mcp_server, app):
+async def test_edit_note_special_characters_in_content(mcp_server, app, test_project):
     """Test editing notes with special characters, Unicode, and markdown formatting."""
 
     async with Client(mcp_server) as client:
@@ -481,6 +505,7 @@ async def test_edit_note_special_characters_in_content(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Special Chars Test",
                 "folder": "test",
                 "content": "# Special Chars Test\n\nBasic content here.",
@@ -514,6 +539,7 @@ def test_function():
         edit_result = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "Special Chars Test",
                 "operation": "append",
                 "content": special_content,
@@ -521,8 +547,8 @@ def test_function():
         )
 
         # Should successfully handle special characters
-        assert len(edit_result) == 1
-        edit_text = edit_result[0].text
+        assert len(edit_result.content) == 1
+        edit_text = edit_result.content[0].text
         assert "Edited note (append)" in edit_text
         assert "## Observations" in edit_text
         assert "unicode:" in edit_text
@@ -532,11 +558,12 @@ def test_function():
         read_result = await client.call_tool(
             "read_note",
             {
+                "project": test_project.name,
                 "identifier": "Special Chars Test",
             },
         )
 
-        content = read_result[0].text
+        content = read_result.content[0].text
         assert "🚀" in content
         assert "测试中文" in content
         assert "∑∏∂∇∆Ω" in content
@@ -545,7 +572,7 @@ def test_function():
 
 
 @pytest.mark.asyncio
-async def test_edit_note_using_different_identifiers(mcp_server, app):
+async def test_edit_note_using_different_identifiers(mcp_server, app, test_project):
     """Test editing notes using different identifier formats (title, permalink, folder/title)."""
 
     async with Client(mcp_server) as client:
@@ -553,6 +580,7 @@ async def test_edit_note_using_different_identifiers(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Identifier Test Note",
                 "folder": "docs",
                 "content": "# Identifier Test Note\n\nOriginal content.",
@@ -564,44 +592,48 @@ async def test_edit_note_using_different_identifiers(mcp_server, app):
         edit_result1 = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "Identifier Test Note",  # by title
                 "operation": "append",
                 "content": "\n\nEdited by title.",
             },
         )
-        assert "Edited note (append)" in edit_result1[0].text
+        assert "Edited note (append)" in edit_result1.content[0].text
 
         # Test editing by permalink
         edit_result2 = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "docs/identifier-test-note",  # by permalink
                 "operation": "append",
                 "content": "\n\nEdited by permalink.",
             },
         )
-        assert "Edited note (append)" in edit_result2[0].text
+        assert "Edited note (append)" in edit_result2.content[0].text
 
         # Test editing by folder/title format
         edit_result3 = await client.call_tool(
             "edit_note",
             {
+                "project": test_project.name,
                 "identifier": "docs/Identifier Test Note",  # by folder/title
                 "operation": "append",
                 "content": "\n\nEdited by folder/title.",
             },
         )
-        assert "Edited note (append)" in edit_result3[0].text
+        assert "Edited note (append)" in edit_result3.content[0].text
 
         # Verify all edits were applied
         read_result = await client.call_tool(
             "read_note",
             {
+                "project": test_project.name,
                 "identifier": "docs/identifier-test-note",
             },
         )
 
-        content = read_result[0].text
+        content = read_result.content[0].text
         assert "Edited by title." in content
         assert "Edited by permalink." in content
         assert "Edited by folder/title." in content

@@ -3,7 +3,7 @@
 from typing import Annotated
 from loguru import logger
 
-from fastapi import Depends, HTTPException, Path, status
+from fastapi import Depends, HTTPException, Path, status, Request
 from sqlalchemy.ext.asyncio import (
     AsyncSession,
     AsyncEngine,
@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import (
 import pathlib
 
 from basic_memory import db
-from basic_memory.config import ProjectConfig, BasicMemoryConfig
+from basic_memory.config import ProjectConfig, BasicMemoryConfig, ConfigManager
 from basic_memory.importers import (
     ChatGPTImporter,
     ClaudeConversationsImporter,
@@ -33,10 +33,10 @@ from basic_memory.services.file_service import FileService
 from basic_memory.services.link_resolver import LinkResolver
 from basic_memory.services.search_service import SearchService
 from basic_memory.sync import SyncService
-from basic_memory.config import app_config
 
 
 def get_app_config() -> BasicMemoryConfig:  # pragma: no cover
+    app_config = ConfigManager().config
     return app_config
 
 
@@ -78,9 +78,24 @@ ProjectConfigDep = Annotated[ProjectConfig, Depends(get_project_config)]  # prag
 
 
 async def get_engine_factory(
-    app_config: AppConfigDep,
+    request: Request,
 ) -> tuple[AsyncEngine, async_sessionmaker[AsyncSession]]:  # pragma: no cover
-    """Get engine and session maker."""
+    """Get cached engine and session maker from app state.
+
+    For API requests, returns cached connections from app.state for optimal performance.
+    For non-API contexts (CLI), falls back to direct database connection.
+    """
+    # Try to get cached connections from app state (API context)
+    if (
+        hasattr(request, "app")
+        and hasattr(request.app.state, "engine")
+        and hasattr(request.app.state, "session_maker")
+    ):
+        return request.app.state.engine, request.app.state.session_maker
+
+    # Fallback for non-API contexts (CLI)
+    logger.debug("Using fallback database connection for non-API context")
+    app_config = get_app_config()
     engine, session_maker = await db.get_or_create_db(app_config.database_path)
     return engine, session_maker
 
@@ -297,6 +312,7 @@ ContextServiceDep = Annotated[ContextService, Depends(get_context_service)]
 
 
 async def get_sync_service(
+    app_config: AppConfigDep,
     entity_service: EntityServiceDep,
     entity_parser: EntityParserDep,
     entity_repository: EntityRepositoryDep,

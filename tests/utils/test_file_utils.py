@@ -3,6 +3,8 @@
 from pathlib import Path
 
 import pytest
+import random
+import string
 
 from basic_memory.file_utils import (
     FileError,
@@ -13,9 +15,23 @@ from basic_memory.file_utils import (
     has_frontmatter,
     parse_frontmatter,
     remove_frontmatter,
+    sanitize_for_filename,
+    sanitize_for_folder,
     update_frontmatter,
     write_file_atomic,
 )
+
+
+def get_random_word(length: int = 12, necessary_char: str | None = None) -> str:
+    letters = string.ascii_lowercase
+    word_chars = [random.choice(letters) for i in range(length)]
+
+    if necessary_char and length > 0:
+        # Replace a character at a random position with the necessary character
+        random_pos = random.randint(0, length - 1)
+        word_chars[random_pos] = necessary_char
+
+    return "".join(word_chars)
 
 
 @pytest.mark.asyncio
@@ -241,3 +257,42 @@ async def test_update_frontmatter_errors(tmp_path: Path):
     nonexistent = tmp_path / "nonexistent" / "test.md"
     with pytest.raises(FileError):
         await update_frontmatter(nonexistent, {"title": "Test"})
+
+
+@pytest.mark.asyncio
+def test_sanitize_for_filename_removes_invalid_characters():
+    # Test all invalid characters listed in the regex
+    invalid_chars = '<>:"|?*'
+
+    # All invalid characters should be replaced
+    for char in invalid_chars:
+        text = get_random_word(length=12, necessary_char=char)
+        sanitized_text = sanitize_for_filename(text)
+
+        assert char not in sanitized_text
+
+
+@pytest.mark.parametrize(
+    "input_folder,expected",
+    [
+        ("", ""),  # Empty string
+        ("   ", ""),  # Whitespace only
+        ("my-folder", "my-folder"),  # Simple folder
+        ("my/folder", "my/folder"),  # Nested folder
+        ("my//folder", "my/folder"),  # Double slash compressed
+        ("my\\\\folder", "my/folder"),  # Windows-style double backslash compressed
+        ("my/folder/", "my/folder"),  # Trailing slash removed
+        ("/my/folder", "my/folder"),  # Leading slash removed
+        ("./my/folder", "my/folder"),  # Leading ./ removed
+        ("my<>folder", "myfolder"),  # Special chars removed
+        ("my:folder|test", "myfoldertest"),  # More special chars removed
+        ("my_folder-1", "my_folder-1"),  # Allowed chars preserved
+        ("my folder", "my folder"),  # Space preserved
+        ("my/folder//sub//", "my/folder/sub"),  # Multiple compressions and trims
+        ("my\\folder\\sub", "my/folder/sub"),  # Windows-style separators normalized
+        ("my/folder<>:|?*sub", "my/foldersub"),  # All invalid chars removed
+        ("////my////folder////", "my/folder"),  # Excessive leading/trailing/multiple slashes
+    ],
+)
+def test_sanitize_for_folder_edge_cases(input_folder, expected):
+    assert sanitize_for_folder(input_folder) == expected

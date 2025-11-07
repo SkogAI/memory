@@ -1,10 +1,10 @@
 """Schemas for memory context."""
 
 from datetime import datetime
-from typing import List, Optional, Annotated, Sequence
+from typing import List, Optional, Annotated, Sequence, Literal, Union, Dict
 
 from annotated_types import MinLen, MaxLen
-from pydantic import BaseModel, Field, BeforeValidator, TypeAdapter
+from pydantic import BaseModel, Field, BeforeValidator, TypeAdapter, field_serializer
 
 from basic_memory.schemas.search import SearchItemType
 
@@ -118,37 +118,49 @@ def memory_url_path(url: memory_url) -> str:  # pyright: ignore
 class EntitySummary(BaseModel):
     """Simplified entity representation."""
 
-    type: str = "entity"
+    type: Literal["entity"] = "entity"
     permalink: Optional[str]
     title: str
     content: Optional[str] = None
     file_path: str
     created_at: datetime
 
+    @field_serializer("created_at")
+    def serialize_created_at(self, dt: datetime) -> str:
+        return dt.isoformat()
+
 
 class RelationSummary(BaseModel):
     """Simplified relation representation."""
 
-    type: str = "relation"
+    type: Literal["relation"] = "relation"
     title: str
     file_path: str
     permalink: str
     relation_type: str
-    from_entity: str
+    from_entity: Optional[str] = None
     to_entity: Optional[str] = None
     created_at: datetime
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, dt: datetime) -> str:
+        return dt.isoformat()
 
 
 class ObservationSummary(BaseModel):
     """Simplified observation representation."""
 
-    type: str = "observation"
+    type: Literal["observation"] = "observation"
     title: str
     file_path: str
     permalink: str
     category: str
     content: str
     created_at: datetime
+
+    @field_serializer("created_at")
+    def serialize_created_at(self, dt: datetime) -> str:
+        return dt.isoformat()
 
 
 class MemoryMetadata(BaseModel):
@@ -165,21 +177,28 @@ class MemoryMetadata(BaseModel):
     total_relations: Optional[int] = None
     total_observations: Optional[int] = None
 
+    @field_serializer("generated_at")
+    def serialize_generated_at(self, dt: datetime) -> str:
+        return dt.isoformat()
+
 
 class ContextResult(BaseModel):
     """Context result containing a primary item with its observations and related items."""
 
-    primary_result: EntitySummary | RelationSummary | ObservationSummary = Field(
-        description="Primary item"
-    )
+    primary_result: Annotated[
+        Union[EntitySummary, RelationSummary, ObservationSummary],
+        Field(discriminator="type", description="Primary item"),
+    ]
 
     observations: Sequence[ObservationSummary] = Field(
         description="Observations belonging to this entity", default_factory=list
     )
 
-    related_results: Sequence[EntitySummary | RelationSummary | ObservationSummary] = Field(
-        description="Related items", default_factory=list
-    )
+    related_results: Sequence[
+        Annotated[
+            Union[EntitySummary, RelationSummary, ObservationSummary], Field(discriminator="type")
+        ]
+    ] = Field(description="Related items", default_factory=list)
 
 
 class GraphContext(BaseModel):
@@ -195,3 +214,50 @@ class GraphContext(BaseModel):
 
     page: Optional[int] = None
     page_size: Optional[int] = None
+
+
+class ActivityStats(BaseModel):
+    """Statistics about activity across all projects."""
+
+    total_projects: int
+    active_projects: int = Field(description="Projects with activity in timeframe")
+    most_active_project: Optional[str] = None
+    total_items: int = Field(description="Total items across all projects")
+    total_entities: int = 0
+    total_relations: int = 0
+    total_observations: int = 0
+
+
+class ProjectActivity(BaseModel):
+    """Activity summary for a single project."""
+
+    project_name: str
+    project_path: str
+    activity: GraphContext = Field(description="The actual activity data for this project")
+    item_count: int = Field(description="Total items in this project's activity")
+    last_activity: Optional[datetime] = Field(
+        default=None, description="Most recent activity timestamp"
+    )
+    active_folders: List[str] = Field(default_factory=list, description="Most active folders")
+
+    @field_serializer("last_activity")
+    def serialize_last_activity(self, dt: Optional[datetime]) -> Optional[str]:
+        return dt.isoformat() if dt else None
+
+
+class ProjectActivitySummary(BaseModel):
+    """Summary of activity across all projects."""
+
+    projects: Dict[str, ProjectActivity] = Field(
+        description="Activity per project, keyed by project name"
+    )
+    summary: ActivityStats
+    timeframe: str = Field(description="The timeframe used for the query")
+    generated_at: datetime
+    guidance: Optional[str] = Field(
+        default=None, description="Assistant guidance for project selection and session management"
+    )
+
+    @field_serializer("generated_at")
+    def serialize_generated_at(self, dt: datetime) -> str:
+        return dt.isoformat()

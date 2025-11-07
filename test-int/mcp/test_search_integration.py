@@ -10,7 +10,7 @@ from fastmcp import Client
 
 
 @pytest.mark.asyncio
-async def test_search_basic_text_search(mcp_server, app):
+async def test_search_basic_text_search(mcp_server, app, test_project):
     """Test basic text search functionality."""
 
     async with Client(mcp_server) as client:
@@ -18,6 +18,7 @@ async def test_search_basic_text_search(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Python Programming Guide",
                 "folder": "docs",
                 "content": "# Python Programming Guide\n\nThis guide covers Python basics and advanced topics.",
@@ -28,6 +29,7 @@ async def test_search_basic_text_search(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Flask Web Development",
                 "folder": "docs",
                 "content": "# Flask Web Development\n\nBuilding web applications with Python Flask framework.",
@@ -38,6 +40,7 @@ async def test_search_basic_text_search(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "JavaScript Basics",
                 "folder": "docs",
                 "content": "# JavaScript Basics\n\nIntroduction to JavaScript programming language.",
@@ -49,22 +52,23 @@ async def test_search_basic_text_search(mcp_server, app):
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "Python",
             },
         )
 
-        assert len(search_result) == 1
-        assert search_result[0].type == "text"
+        assert len(search_result.content) == 1
+        assert search_result.content[0].type == "text"
 
         # Parse the response (it should be a SearchResponse)
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         assert "Python Programming Guide" in result_text
         assert "Flask Web Development" in result_text
         assert "JavaScript Basics" not in result_text
 
 
 @pytest.mark.asyncio
-async def test_search_boolean_operators(mcp_server, app):
+async def test_search_boolean_operators(mcp_server, app, test_project):
     """Test boolean search operators (AND, OR, NOT)."""
 
     async with Client(mcp_server) as client:
@@ -72,6 +76,7 @@ async def test_search_boolean_operators(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Python Flask Tutorial",
                 "folder": "tutorials",
                 "content": "# Python Flask Tutorial\n\nLearn Python web development with Flask.",
@@ -82,6 +87,7 @@ async def test_search_boolean_operators(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Python Django Guide",
                 "folder": "tutorials",
                 "content": "# Python Django Guide\n\nBuilding web apps with Python Django framework.",
@@ -92,6 +98,7 @@ async def test_search_boolean_operators(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "React JavaScript",
                 "folder": "tutorials",
                 "content": "# React JavaScript\n\nBuilding frontend applications with React.",
@@ -103,11 +110,12 @@ async def test_search_boolean_operators(mcp_server, app):
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "Python AND Flask",
             },
         )
 
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         assert "Python Flask Tutorial" in result_text
         assert "Python Django Guide" not in result_text
         assert "React JavaScript" not in result_text
@@ -116,11 +124,12 @@ async def test_search_boolean_operators(mcp_server, app):
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "Flask OR Django",
             },
         )
 
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         assert "Python Flask Tutorial" in result_text
         assert "Python Django Guide" in result_text
         assert "React JavaScript" not in result_text
@@ -129,17 +138,18 @@ async def test_search_boolean_operators(mcp_server, app):
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "Python NOT Django",
             },
         )
 
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         assert "Python Flask Tutorial" in result_text
         assert "Python Django Guide" not in result_text
 
 
 @pytest.mark.asyncio
-async def test_search_title_only(mcp_server, app):
+async def test_search_title_only(mcp_server, app, test_project):
     """Test searching in titles only."""
 
     async with Client(mcp_server) as client:
@@ -147,6 +157,7 @@ async def test_search_title_only(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Database Design",
                 "folder": "docs",
                 "content": "# Database Design\n\nThis covers SQL and database concepts.",
@@ -157,6 +168,7 @@ async def test_search_title_only(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Web Development",
                 "folder": "docs",
                 "content": "# Web Development\n\nDatabase integration in web applications.",
@@ -168,18 +180,19 @@ async def test_search_title_only(mcp_server, app):
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "Database",
                 "search_type": "title",
             },
         )
 
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         assert "Database Design" in result_text
         assert "Web Development" not in result_text  # Has "database" in content but not title
 
 
 @pytest.mark.asyncio
-async def test_search_permalink_exact(mcp_server, app):
+async def test_search_permalink_exact(mcp_server, app, test_project):
     """Test exact permalink search."""
 
     async with Client(mcp_server) as client:
@@ -187,6 +200,7 @@ async def test_search_permalink_exact(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "API Documentation",
                 "folder": "api",
                 "content": "# API Documentation\n\nComplete API reference guide.",
@@ -197,6 +211,7 @@ async def test_search_permalink_exact(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "API Testing",
                 "folder": "testing",
                 "content": "# API Testing\n\nHow to test REST APIs.",
@@ -208,18 +223,19 @@ async def test_search_permalink_exact(mcp_server, app):
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "api/api-documentation",
                 "search_type": "permalink",
             },
         )
 
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         assert "API Documentation" in result_text
         assert "API Testing" not in result_text
 
 
 @pytest.mark.asyncio
-async def test_search_permalink_pattern(mcp_server, app):
+async def test_search_permalink_pattern(mcp_server, app, test_project):
     """Test permalink pattern search with wildcards."""
 
     async with Client(mcp_server) as client:
@@ -227,6 +243,7 @@ async def test_search_permalink_pattern(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Meeting Notes January",
                 "folder": "meetings",
                 "content": "# Meeting Notes January\n\nJanuary team meeting notes.",
@@ -237,6 +254,7 @@ async def test_search_permalink_pattern(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Meeting Notes February",
                 "folder": "meetings",
                 "content": "# Meeting Notes February\n\nFebruary team meeting notes.",
@@ -247,6 +265,7 @@ async def test_search_permalink_pattern(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Project Notes",
                 "folder": "projects",
                 "content": "# Project Notes\n\nGeneral project documentation.",
@@ -258,19 +277,20 @@ async def test_search_permalink_pattern(mcp_server, app):
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "meetings/*",
                 "search_type": "permalink",
             },
         )
 
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         assert "Meeting Notes January" in result_text
         assert "Meeting Notes February" in result_text
         assert "Project Notes" not in result_text
 
 
 @pytest.mark.asyncio
-async def test_search_entity_type_filter(mcp_server, app):
+async def test_search_entity_type_filter(mcp_server, app, test_project):
     """Test filtering search results by entity type."""
 
     async with Client(mcp_server) as client:
@@ -292,6 +312,7 @@ Regular content about development practices."""
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Development Process",
                 "folder": "processes",
                 "content": content_with_observations,
@@ -303,18 +324,19 @@ Regular content about development practices."""
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "development",
                 "entity_types": ["entity"],
             },
         )
 
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         # Should find the main entity but filter out observations/relations
         assert "Development Process" in result_text
 
 
 @pytest.mark.asyncio
-async def test_search_pagination(mcp_server, app):
+async def test_search_pagination(mcp_server, app, test_project):
     """Test search result pagination."""
 
     async with Client(mcp_server) as client:
@@ -323,6 +345,7 @@ async def test_search_pagination(mcp_server, app):
             await client.call_tool(
                 "write_note",
                 {
+                    "project": test_project.name,
                     "title": f"Test Note {i + 1:02d}",
                     "folder": "test",
                     "content": f"# Test Note {i + 1:02d}\n\nThis is test content for pagination testing.",
@@ -334,33 +357,35 @@ async def test_search_pagination(mcp_server, app):
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "test",
                 "page": 1,
                 "page_size": 5,
             },
         )
 
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         # Should contain 5 results and pagination info
-        assert '"current_page": 1' in result_text
-        assert '"page_size": 5' in result_text
+        assert '"current_page":1' in result_text
+        assert '"page_size":5' in result_text
 
         # Search page 2
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "test",
                 "page": 2,
                 "page_size": 5,
             },
         )
 
-        result_text = search_result[0].text
-        assert '"current_page": 2' in result_text
+        result_text = search_result.content[0].text
+        assert '"current_page":2' in result_text
 
 
 @pytest.mark.asyncio
-async def test_search_no_results(mcp_server, app):
+async def test_search_no_results(mcp_server, app, test_project):
     """Test search with no matching results."""
 
     async with Client(mcp_server) as client:
@@ -368,6 +393,7 @@ async def test_search_no_results(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Sample Note",
                 "folder": "test",
                 "content": "# Sample Note\n\nThis is a sample note for testing.",
@@ -379,16 +405,17 @@ async def test_search_no_results(mcp_server, app):
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "nonexistent",
             },
         )
 
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         assert '"results": []' in result_text or '"results":[]' in result_text
 
 
 @pytest.mark.asyncio
-async def test_search_complex_boolean_query(mcp_server, app):
+async def test_search_complex_boolean_query(mcp_server, app, test_project):
     """Test complex boolean queries with grouping."""
 
     async with Client(mcp_server) as client:
@@ -396,6 +423,7 @@ async def test_search_complex_boolean_query(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Python Web Development",
                 "folder": "tutorials",
                 "content": "# Python Web Development\n\nLearn Python for web development using Flask and Django.",
@@ -406,6 +434,7 @@ async def test_search_complex_boolean_query(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Python Data Science",
                 "folder": "tutorials",
                 "content": "# Python Data Science\n\nData analysis and machine learning with Python.",
@@ -416,6 +445,7 @@ async def test_search_complex_boolean_query(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "JavaScript Web Development",
                 "folder": "tutorials",
                 "content": "# JavaScript Web Development\n\nBuilding web applications with JavaScript and React.",
@@ -427,18 +457,19 @@ async def test_search_complex_boolean_query(mcp_server, app):
         search_result = await client.call_tool(
             "search_notes",
             {
+                "project": test_project.name,
                 "query": "(Python OR JavaScript) AND web",
             },
         )
 
-        result_text = search_result[0].text
+        result_text = search_result.content[0].text
         assert "Python Web Development" in result_text
         assert "JavaScript Web Development" in result_text
         assert "Python Data Science" not in result_text  # Has Python but not web
 
 
 @pytest.mark.asyncio
-async def test_search_case_insensitive(mcp_server, app):
+async def test_search_case_insensitive(mcp_server, app, test_project):
     """Test that search is case insensitive."""
 
     async with Client(mcp_server) as client:
@@ -446,6 +477,7 @@ async def test_search_case_insensitive(mcp_server, app):
         await client.call_tool(
             "write_note",
             {
+                "project": test_project.name,
                 "title": "Machine Learning Guide",
                 "folder": "guides",
                 "content": "# Machine Learning Guide\n\nIntroduction to MACHINE LEARNING concepts.",
@@ -460,9 +492,10 @@ async def test_search_case_insensitive(mcp_server, app):
             search_result = await client.call_tool(
                 "search_notes",
                 {
+                    "project": test_project.name,
                     "query": search_term,
                 },
             )
 
-            result_text = search_result[0].text
+            result_text = search_result.content[0].text
             assert "Machine Learning Guide" in result_text, f"Failed for search term: {search_term}"

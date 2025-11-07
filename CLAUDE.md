@@ -14,15 +14,15 @@ See the [README.md](README.md) file for a project overview.
 
 ### Build and Test Commands
 
-- Install: `just install` or `pip install -e ".[dev]"`
-- Run tests: `uv run pytest -p pytest_mock -v` or `just test`
+- Install: `make install` or `pip install -e ".[dev]"`
+- Run tests: `uv run pytest -p pytest_mock -v` or `make test`
 - Single test: `pytest tests/path/to/test_file.py::test_function_name`
-- Lint: `just lint` or `ruff check . --fix`
-- Type check: `just type-check` or `uv run pyright`
-- Format: `just format` or `uv run ruff format .`
-- Run all code checks: `just check` (runs lint, format, type-check, test)
-- Create db migration: `just migration "Your migration message"`
-- Run development MCP Inspector: `just run-inspector`
+- Lint: `make lint` or `ruff check . --fix`
+- Type check: `make type-check` or `uv run pyright`
+- Format: `make format` or `uv run ruff format .`
+- Run all code checks: `make check` (runs lint, format, type-check, test)
+- Create db migration: `make migration m="Your migration message"`
+- Run development MCP Inspector: `make run-inspector`
 
 ### Code Style Guidelines
 
@@ -37,7 +37,6 @@ See the [README.md](README.md) file for a project overview.
 - API uses FastAPI for endpoints
 - Follow the repository pattern for data access
 - Tools communicate to api routers via the httpx ASGI client (in process)
-- avoid using "private" functions in modules or classes (prepended with _)
 
 ### Codebase Architecture
 
@@ -65,7 +64,6 @@ See the [README.md](README.md) file for a project overview.
 - Test database uses in-memory SQLite
 - Avoid creating mocks in tests in most circumstances.
 - Each test runs in a standalone environment with in memory SQLite and tmp_file directory
-- Do not use mocks in tests if possible. Tests run with an in memory sqlite db, so they are not needed. See fixtures in conftest.py
 
 ## BASIC MEMORY PRODUCT USAGE
 
@@ -108,7 +106,7 @@ See the [README.md](README.md) file for a project overview.
       1d", "1 week")
 
   **Search & Discovery:**
-    - `search_notes(query, page, page_size)` - Full-text search across all content with filtering options
+    - `search(query, page, page_size)` - Full-text search across all content with filtering options
 
   **Visualization:**
     - `canvas(nodes, edges, title, folder)` - Generate Obsidian canvas files for knowledge graph visualization
@@ -116,7 +114,7 @@ See the [README.md](README.md) file for a project overview.
 - MCP Prompts for better AI interaction:
     - `ai_assistant_guide()` - Guidance on effectively using Basic Memory tools for AI assistants
     - `continue_conversation(topic, timeframe)` - Continue previous conversations with relevant historical context
-    - `search_notes(query, after_date)` - Search with detailed, formatted results for better context understanding
+    - `search(query, after_date)` - Search with detailed, formatted results for better context understanding
     - `recent_activity(timeframe)` - View recently changed items with formatted output
     - `json_canvas_spec()` - Full JSON Canvas specification for Obsidian visualization
 
@@ -136,32 +134,30 @@ could achieve independently.
 
 ## GitHub Integration
 
-Basic Memory uses Claude directly into the development workflow through GitHub:
+Basic Memory has taken AI-Human collaboration to the next level by integrating Claude directly into the development workflow through GitHub:
 
 ### GitHub MCP Tools
 
-Using the GitHub Model Context Protocol server, Claude can:
+Using the GitHub Model Context Protocol server, Claude can now:
 
 - **Repository Management**:
-    - View repository files and structure
-    - Read file contents
-    - Create new branches
-    - Create and update files
+  - View repository files and structure
+  - Read file contents
+  - Create new branches
+  - Create and update files
 
 - **Issue Management**:
-    - Create new issues
-    - Comment on existing issues
-    - Close and update issues
-    - Search across issues
+  - Create new issues
+  - Comment on existing issues
+  - Close and update issues
+  - Search across issues
 
 - **Pull Request Workflow**:
-    - Create pull requests
-    - Review code changes
-    - Add comments to PRs
+  - Create pull requests
+  - Review code changes
+  - Add comments to PRs
 
-This integration enables Claude to participate as a full team member in the development process, not just as a code
-generation tool. Claude's GitHub account ([bm-claudeai](https://github.com/bm-claudeai)) is a member of the Basic
-Machines organization with direct contributor access to the codebase.
+This integration enables Claude to participate as a full team member in the development process, not just as a code generation tool. Claude's GitHub account ([bm-claudeai](https://github.com/bm-claudeai)) is a member of the Basic Machines organization with direct contributor access to the codebase.
 
 ### Collaborative Development Process
 
@@ -172,53 +168,4 @@ With GitHub integration, the development workflow includes:
 3. **Branch management** - Claude can create feature branches for implementations
 4. **Documentation maintenance** - Claude can keep documentation updated as the code evolves
 
-With this integration, the AI assistant is a full-fledged team member rather than just a tool for generating code
-snippets.
-
-
-### Basic Memory Pro
-
-Basic Memory Pro is a desktop GUI application that wraps the basic-memory CLI/MCP tools:
-
-- Built with Tauri (Rust), React (TypeScript), and a Python FastAPI sidecar
-- Provides visual knowledge graph exploration and project management
-- Uses the same core codebase but adds a desktop-friendly interface
-- Project configuration is shared between CLI and Pro versions
-- Multiple project support with visual switching interface
-
-local repo: /Users/phernandez/dev/basicmachines/basic-memory-pro
-github: https://github.com/basicmachines-co/basic-memory-pro
-
-## Release and Version Management
-
-Basic Memory uses `uv-dynamic-versioning` for automatic version management based on git tags:
-
-### Version Types
-- **Development versions**: Automatically generated from commits (e.g., `0.12.4.dev26+468a22f`)
-- **Beta releases**: Created by tagging with beta suffixes (e.g., `v0.13.0b1`, `v0.13.0rc1`)
-- **Stable releases**: Created by tagging with version numbers (e.g., `v0.13.0`)
-
-### Release Workflows
-
-#### Development Builds (Automatic)
-- Triggered on every push to `main` branch
-- Publishes dev versions like `0.12.4.dev26+468a22f` to PyPI
-- Allows continuous testing of latest changes
-- Users install with: `pip install basic-memory --pre --force-reinstall`
-
-#### Beta/RC Releases (Manual)
-- Create beta tag: `git tag v0.13.0b1 && git push origin v0.13.0b1`
-- Automatically builds and publishes to PyPI as pre-release
-- Users install with: `pip install basic-memory --pre`
-- Use for milestone testing before stable release
-
-#### Stable Releases (Manual)
-- Create version tag: `git tag v0.13.0 && git push origin v0.13.0`
-- Automatically builds, creates GitHub release, and publishes to PyPI
-- Users install with: `pip install basic-memory`
-
-### For Development
-- No manual version bumping required
-- Versions automatically derived from git tags
-- `pyproject.toml` uses `dynamic = ["version"]`
-- `__init__.py` dynamically reads version from package metadata
+This level of integration represents a new paradigm in AI-human collaboration, where the AI assistant becomes a full-fledged team member rather than just a tool for generating code snippets.
