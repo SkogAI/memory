@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## v0.19.1 (2026-03-08)
+
+### Bug Fixes
+
+- **#649**: Enforce strict entity resolution in destructive MCP tools (`edit_note`, `move_note`, `delete_note`)
+  - Prevents fuzzy-match fallback from silently editing/moving/deleting the wrong note
+  - DST-related timeframe validation fix (round instead of truncate days)
+
+### Features
+
+- **#648**: Add `insert_before_section` and `insert_after_section` edit operations
+- Add `GET /knowledge/graph` endpoint for full graph visualization
+
+### Dependencies
+
+- Bump authlib from 1.6.6 to 1.6.7
+
 ## v0.19.0 (2026-03-07)
 
 ### Highlights
