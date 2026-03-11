@@ -128,7 +128,7 @@ def list_projects(
         table.add_column("Cloud Path", style="green")
         table.add_column("Workspace", style="green")
         table.add_column("CLI Route", style="blue")
-        table.add_column("MCP (stdio)", style="blue")
+        table.add_column("MCP", style="blue")
         table.add_column("Sync", style="green")
         table.add_column("Default", style="magenta")
 
@@ -164,6 +164,11 @@ def list_projects(
             elif entry and entry.mode == ProjectMode.LOCAL and entry.path:
                 local_path = format_path(normalize_project_path(entry.path))
 
+            # Clear local path for cloud-mode projects — only local projects
+            # should display a local path
+            if entry and entry.mode == ProjectMode.CLOUD:
+                local_path = ""
+
             cloud_path = ""
             if cloud_project is not None:
                 cloud_path = normalize_project_path(cloud_project.path)
@@ -182,7 +187,13 @@ def list_projects(
             is_default = config.default_project == project_name
 
             has_sync = bool(entry and entry.local_sync_path)
-            mcp_stdio_target = "local" if local_project is not None else "n/a"
+            # Determine MCP transport based on project routing mode
+            if entry and entry.mode == ProjectMode.CLOUD:
+                mcp_transport = "https"
+            elif entry is None and cloud_project is not None:
+                mcp_transport = "https"
+            else:
+                mcp_transport = "stdio"
 
             # Show workspace name (type) for cloud-sourced projects
             ws_label = ""
@@ -195,7 +206,7 @@ def list_projects(
                 "local_path": local_path,
                 "cloud_path": cloud_path,
                 "cli_route": cli_route,
-                "mcp_stdio": mcp_stdio_target,
+                "mcp_stdio": mcp_transport,
                 "sync": has_sync,
                 "is_default": is_default,
             }
