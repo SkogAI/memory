@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+## v0.20.1 (2026-03-10)
+
+### Bug Fixes
+
+- **#661**: Fix `bm project list` MCP column to show transport type (stdio/https) instead of DB presence
+  - Renamed "MCP (stdio)" column to "MCP"
+  - Shows actual routing mode: `stdio` for local, `https` for cloud projects
+  - Clears local path display for cloud-mode projects
+- **#662**: Invalidate config cache when file is modified by another process
+  - Adds mtime-based cache validation to `ConfigManager.load_config()`
+  - Long-lived processes (MCP stdio server) now detect external config changes
+  - Fixes `bm project set-cloud` having no effect on running MCP server
+
 ## v0.20.0 (2026-03-10)
 
 ### Features
