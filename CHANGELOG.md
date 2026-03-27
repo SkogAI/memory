@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## v0.20.3 (2026-03-26)
+
+### Bug Fixes
+
+- **#698**: CLI cloud commands now use API key when configured
+  - `get_authenticated_headers()` only checked OAuth tokens, ignoring `config.cloud_api_key`
+  - All CLI cloud commands (`upload`, `status`, `snapshot`, `restore`, etc.) failed for API-key-only users while MCP tools worked fine
+  - Now mirrors the same credential priority as MCP: API key first, OAuth fallback
+  - Fixes `bm cloud upload --project` returning "project does not exist" when authenticated with `bmc_*` API key
+
 ## v0.20.2 (2026-03-10)
 
 ### Bug Fixes
