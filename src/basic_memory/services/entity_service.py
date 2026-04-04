@@ -242,9 +242,17 @@ class EntityService(BaseService[EntityModel]):
 
         # Try to find existing entity using strict resolution (no fuzzy search)
         # This prevents incorrectly matching similar file paths like "Node A.md" and "Node C.md"
-        existing = await self.link_resolver.resolve_link(schema.file_path, strict=True)
+        existing = await self.link_resolver.resolve_link(
+            schema.file_path,
+            strict=True,
+            load_relations=False,
+        )
         if not existing and schema.permalink:
-            existing = await self.link_resolver.resolve_link(schema.permalink, strict=True)
+            existing = await self.link_resolver.resolve_link(
+                schema.permalink,
+                strict=True,
+                load_relations=False,
+            )
 
         if existing:
             logger.debug(f"Found existing entity: {existing.file_path}")
@@ -863,10 +871,22 @@ class EntityService(BaseService[EntityModel]):
         """
         logger.debug(f"Updating entity and observations: {file_path}")
 
-        db_entity = await self.repository.get_by_file_path(file_path.as_posix())
+        with telemetry.scope(
+            "upsert.update.fetch_entity",
+            domain="entity_service",
+            action="upsert",
+            phase="fetch_entity",
+        ):
+            db_entity = await self.repository.get_by_file_path(file_path.as_posix())
 
         # Clear observations for entity
-        await self.observation_repository.delete_by_fields(entity_id=db_entity.id)
+        with telemetry.scope(
+            "upsert.update.delete_observations",
+            domain="entity_service",
+            action="upsert",
+            phase="delete_observations",
+        ):
+            await self.observation_repository.delete_by_fields(entity_id=db_entity.id)
 
         # add new observations
         observations = [
@@ -880,7 +900,14 @@ class EntityService(BaseService[EntityModel]):
             )
             for obs in markdown.observations
         ]
-        await self.observation_repository.add_all(observations)
+        with telemetry.scope(
+            "upsert.update.insert_observations",
+            domain="entity_service",
+            action="upsert",
+            phase="insert_observations",
+            count=len(observations),
+        ):
+            await self.observation_repository.add_all(observations)
 
         # update values from markdown
         db_entity = entity_model_from_markdown(file_path, markdown, db_entity)
@@ -894,10 +921,16 @@ class EntityService(BaseService[EntityModel]):
             db_entity.last_updated_by = user_id
 
         # update entity
-        return await self.repository.update(
-            db_entity.id,
-            db_entity,
-        )
+        with telemetry.scope(
+            "upsert.update.save_entity",
+            domain="entity_service",
+            action="upsert",
+            phase="save_entity",
+        ):
+            return await self.repository.update(
+                db_entity.id,
+                db_entity,
+            )
 
     async def upsert_entity_from_markdown(
         self,
@@ -911,20 +944,30 @@ class EntityService(BaseService[EntityModel]):
             created = await self.create_entity_from_markdown(file_path, markdown)
         else:
             created = await self.update_entity_and_observations(file_path, markdown)
-        return await self.update_entity_relations(created.file_path, markdown)
+        # Pass entity directly — avoids redundant get_by_file_path inside update_entity_relations
+        return await self.update_entity_relations(created, markdown)
 
     async def update_entity_relations(
         self,
-        path: str,
+        entity: EntityModel,
         markdown: EntityMarkdown,
     ) -> EntityModel:
-        """Update relations for entity"""
-        logger.debug(f"Updating relations for entity: {path}")
+        """Update relations for entity.
 
-        db_entity = await self.repository.get_by_file_path(path)
+        Accepts the entity object directly to avoid a redundant DB fetch.
+        Only entity.id and entity.permalink are used from the passed-in object.
+        """
+        entity_id = entity.id
+        logger.debug(f"Updating relations for entity: {entity.file_path}")
 
         # Clear existing relations first
-        await self.relation_repository.delete_outgoing_relations_from_entity(db_entity.id)
+        with telemetry.scope(
+            "upsert.relations.delete_existing",
+            domain="entity_service",
+            action="upsert",
+            phase="delete_relations",
+        ):
+            await self.relation_repository.delete_outgoing_relations_from_entity(entity_id)
 
         # Batch resolve all relation targets in parallel
         if markdown.relations:
@@ -934,12 +977,23 @@ class EntityService(BaseService[EntityModel]):
             # Use strict=True to disable fuzzy search - only exact matches should create resolved relations
             # This ensures forward references (links to non-existent entities) remain unresolved (to_id=NULL)
             lookup_tasks = [
-                self.link_resolver.resolve_link(rel.target, strict=True)
+                self.link_resolver.resolve_link(
+                    rel.target,
+                    strict=True,
+                    load_relations=False,
+                )
                 for rel in markdown.relations
             ]
 
             # Execute all lookups in parallel
-            resolved_entities = await asyncio.gather(*lookup_tasks, return_exceptions=True)
+            with telemetry.scope(
+                "upsert.relations.resolve_links",
+                domain="entity_service",
+                action="upsert",
+                phase="resolve_links",
+                count=len(lookup_tasks),
+            ):
+                resolved_entities = await asyncio.gather(*lookup_tasks, return_exceptions=True)
 
             # Process results and create relation records
             relations_to_add = []
@@ -958,7 +1012,7 @@ class EntityService(BaseService[EntityModel]):
                 # Create the relation
                 relation = Relation(
                     project_id=self.relation_repository.project_id,
-                    from_id=db_entity.id,
+                    from_id=entity_id,
                     to_id=target_id,
                     to_name=target_name,
                     relation_type=rel.type,
@@ -968,22 +1022,37 @@ class EntityService(BaseService[EntityModel]):
 
             # Batch insert all relations
             if relations_to_add:
-                try:
-                    await self.relation_repository.add_all(relations_to_add)
-                except IntegrityError:
-                    # Some relations might be duplicates - fall back to individual inserts
-                    logger.debug("Batch relation insert failed, trying individual inserts")
-                    for relation in relations_to_add:
-                        try:
-                            await self.relation_repository.add(relation)
-                        except IntegrityError:
-                            # Unique constraint violation - relation already exists
-                            logger.debug(
-                                f"Skipping duplicate relation {relation.relation_type} from {db_entity.permalink}"
-                            )
-                            continue
+                with telemetry.scope(
+                    "upsert.relations.insert_relations",
+                    domain="entity_service",
+                    action="upsert",
+                    phase="insert_relations",
+                    count=len(relations_to_add),
+                ):
+                    try:
+                        await self.relation_repository.add_all(relations_to_add)
+                    except IntegrityError:
+                        # Some relations might be duplicates - fall back to individual inserts
+                        logger.debug("Batch relation insert failed, trying individual inserts")
+                        for relation in relations_to_add:
+                            try:
+                                await self.relation_repository.add(relation)
+                            except IntegrityError:
+                                # Unique constraint violation - relation already exists
+                                logger.debug(
+                                    f"Skipping duplicate relation {relation.relation_type} from {entity.permalink}"
+                                )
+                                continue
 
-        return await self.repository.get_by_file_path(path)
+        # Reload entity with relations via PK lookup (faster than get_by_file_path string match)
+        with telemetry.scope(
+            "upsert.relations.reload_entity",
+            domain="entity_service",
+            action="upsert",
+            phase="reload_entity",
+        ):
+            reloaded = await self.repository.find_by_ids([entity_id])
+        return reloaded[0]
 
     async def edit_entity(
         self,
@@ -1040,7 +1109,11 @@ class EntityService(BaseService[EntityModel]):
             action="edit",
             phase="resolve_entity",
         ):
-            entity = await self.link_resolver.resolve_link(identifier, strict=True)
+            entity = await self.link_resolver.resolve_link(
+                identifier,
+                strict=True,
+                load_relations=False,
+            )
         if not entity:
             raise EntityNotFoundError(f"Entity not found: {identifier}")
 
