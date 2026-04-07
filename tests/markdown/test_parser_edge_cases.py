@@ -177,6 +177,27 @@ async def test_malformed_frontmatter(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_null_bytes_stripped(tmp_path):
+    """Test that null bytes are stripped from content before parsing.
+
+    PostgreSQL rejects null bytes (0x00) in text columns. Some files
+    (e.g. Claude agent definitions) can contain embedded nulls.
+    """
+    content = "---\ntitle: Test\ntype: note\n---\n\nSome content\x00with nulls\x00inside\n"
+
+    parser = EntityParser(tmp_path)
+    entity = await parser.parse_markdown_content(
+        file_path=tmp_path / "nulls.md",
+        content=content,
+    )
+
+    assert "\x00" not in entity.content
+    assert "Some content" in entity.content
+    assert "with nulls" in entity.content
+    assert "inside" in entity.content
+
+
+@pytest.mark.asyncio
 async def test_file_not_found():
     """Test handling of non-existent files."""
     parser = EntityParser(Path("/tmp"))

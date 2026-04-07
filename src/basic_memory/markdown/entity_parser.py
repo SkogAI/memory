@@ -249,6 +249,10 @@ class EntityParser:
 
         content = strip_bom(content)
 
+        # PostgreSQL rejects null bytes (0x00) in text columns.
+        # Some markdown files (e.g. Claude agent definitions) contain embedded nulls.
+        content = content.replace("\x00", "")
+
         # Parse frontmatter with proper error handling for malformed YAML.
         # We use frontmatter.parse() instead of frontmatter.loads() because
         # loads() does Post(content, handler, **metadata), which crashes when
