@@ -51,7 +51,7 @@ RECALL_AT_5_THRESHOLDS: dict[tuple[str, str, str], float] = {
     ("sqlite-fastembed", "paraphrase", "hybrid"): 0.25,
     ("postgres-fastembed", "lexical", "hybrid"): 0.37,
     ("postgres-fastembed", "paraphrase", "hybrid"): 0.25,
-    # OpenAI hybrid should handle paraphrases better than FastEmbed
+    # OpenAI hybrid should handle paraphrases better than FastEmbed.
     ("postgres-openai", "lexical", "hybrid"): 0.37,
     ("postgres-openai", "paraphrase", "hybrid"): 0.25,
 }
