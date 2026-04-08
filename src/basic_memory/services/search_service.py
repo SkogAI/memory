@@ -1,5 +1,6 @@
 """Service for search operations."""
 
+import asyncio
 import ast
 import re
 from datetime import datetime
@@ -427,6 +428,15 @@ class SearchService:
 
     async def sync_entity_vectors(self, entity_id: int) -> None:
         """Refresh vector chunks for one entity in repositories that support semantic indexing."""
+        entity = await self.entity_repository.find_by_id(entity_id)
+        if entity is None:
+            await self._clear_entity_vectors(entity_id)
+            return
+
+        if not self._entity_embeddings_enabled(entity):
+            await self._clear_entity_vectors(entity_id)
+            return
+
         await self.repository.sync_entity_vectors(entity_id)
 
     async def sync_entity_vectors_batch(
@@ -435,10 +445,90 @@ class SearchService:
         progress_callback=None,
     ) -> VectorSyncBatchResult:
         """Refresh vector chunks for a batch of entities."""
-        return await self.repository.sync_entity_vectors_batch(
-            entity_ids,
-            progress_callback=progress_callback,
+        if not entity_ids:
+            return VectorSyncBatchResult(
+                entities_total=0,
+                entities_synced=0,
+                entities_failed=0,
+            )
+
+        entities_by_id = {
+            entity.id: entity for entity in await self.entity_repository.find_by_ids(entity_ids)
+        }
+        unknown_ids = [entity_id for entity_id in entity_ids if entity_id not in entities_by_id]
+        opted_out_ids = [
+            entity_id
+            for entity_id in entity_ids
+            if (
+                (entity := entities_by_id.get(entity_id)) is not None
+                and not self._entity_embeddings_enabled(entity)
+            )
+        ]
+        if opted_out_ids:
+            await asyncio.gather(
+                *(self._clear_entity_vectors(entity_id) for entity_id in opted_out_ids)
+            )
+
+        eligible_entity_ids = [
+            entity_id
+            for entity_id in entity_ids
+            if entity_id in entities_by_id and entity_id not in opted_out_ids
+        ]
+
+        cleanup_task = (
+            self.repository.sync_entity_vectors_batch(unknown_ids) if unknown_ids else None
         )
+        eligible_task = (
+            self.repository.sync_entity_vectors_batch(
+                eligible_entity_ids,
+                progress_callback=progress_callback,
+            )
+            if eligible_entity_ids
+            else None
+        )
+        repository_results = [
+            result
+            for result in await asyncio.gather(
+                cleanup_task if cleanup_task is not None else asyncio.sleep(0, result=None),
+                eligible_task if eligible_task is not None else asyncio.sleep(0, result=None),
+            )
+            if result is not None
+        ]
+
+        if not repository_results:
+            return VectorSyncBatchResult(
+                entities_total=len(entity_ids),
+                entities_synced=0,
+                entities_failed=0,
+                entities_skipped=len(opted_out_ids),
+            )
+
+        batch_result = VectorSyncBatchResult(
+            entities_total=len(entity_ids),
+            entities_synced=sum(result.entities_synced for result in repository_results),
+            entities_failed=sum(result.entities_failed for result in repository_results),
+            entities_deferred=sum(result.entities_deferred for result in repository_results),
+            entities_skipped=(
+                len(opted_out_ids)
+                + sum(result.entities_skipped for result in repository_results)
+                - len(unknown_ids)
+            ),
+            failed_entity_ids=[
+                failed_entity_id
+                for result in repository_results
+                for failed_entity_id in result.failed_entity_ids
+            ],
+            chunks_total=sum(result.chunks_total for result in repository_results),
+            chunks_skipped=sum(result.chunks_skipped for result in repository_results),
+            embedding_jobs_total=sum(result.embedding_jobs_total for result in repository_results),
+            prepare_seconds_total=sum(result.prepare_seconds_total for result in repository_results),
+            queue_wait_seconds_total=sum(
+                result.queue_wait_seconds_total for result in repository_results
+            ),
+            embed_seconds_total=sum(result.embed_seconds_total for result in repository_results),
+            write_seconds_total=sum(result.write_seconds_total for result in repository_results),
+        )
+        return batch_result
 
     async def reindex_vectors(self, progress_callback=None) -> dict:
         """Rebuild vector embeddings for all entities.
@@ -456,14 +546,14 @@ class SearchService:
         # that reference entity_ids no longer in the entity table
         await self._purge_stale_search_rows()
 
-        batch_result = await self.repository.sync_entity_vectors_batch(
+        batch_result = await self.sync_entity_vectors_batch(
             entity_ids,
             progress_callback=progress_callback,
         )
         stats = {
             "total_entities": batch_result.entities_total,
             "embedded": batch_result.entities_synced,
-            "skipped": 0,
+            "skipped": batch_result.entities_skipped,
             "errors": batch_result.entities_failed,
         }
 
@@ -517,6 +607,60 @@ class SearchService:
         )
 
         logger.info("Purged stale search rows for deleted entities", project_id=project_id)
+
+    @staticmethod
+    def _entity_embeddings_enabled(entity: Entity) -> bool:
+        """Return whether semantic embeddings should be generated for this entity."""
+        if not entity.entity_metadata:
+            return True
+
+        embed_value = entity.entity_metadata.get("embed")
+        if embed_value is None:
+            return True
+        if isinstance(embed_value, bool):
+            return embed_value
+        if isinstance(embed_value, str):
+            normalized = embed_value.strip().lower()
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+        if isinstance(embed_value, (int, float)):
+            return bool(embed_value)
+
+        # Default unknown values to enabled so malformed metadata does not silently
+        # remove notes from semantic search.
+        return True
+
+    async def _clear_entity_vectors(self, entity_id: int) -> None:
+        """Delete derived vector rows for one entity."""
+        from basic_memory.repository.search_repository_base import SearchRepositoryBase
+        from basic_memory.repository.sqlite_search_repository import SQLiteSearchRepository
+
+        # Trigger: semantic indexing is disabled for this repository instance.
+        # Why: repositories only create vector tables when semantic search is enabled.
+        # Outcome: skip cleanup because there are no active derived vector rows to maintain.
+        if isinstance(self.repository, SearchRepositoryBase) and not self.repository._semantic_enabled:
+            return
+
+        params = {"project_id": self.repository.project_id, "entity_id": entity_id}
+        if isinstance(self.repository, SQLiteSearchRepository):
+            await self.repository.execute_query(
+                text(
+                    "DELETE FROM search_vector_embeddings WHERE rowid IN ("
+                    "SELECT id FROM search_vector_chunks "
+                    "WHERE project_id = :project_id AND entity_id = :entity_id)"
+                ),
+                params,
+            )
+
+        await self.repository.execute_query(
+            text(
+                "DELETE FROM search_vector_chunks "
+                "WHERE project_id = :project_id AND entity_id = :entity_id"
+            ),
+            params,
+        )
 
     async def index_entity_file(
         self,

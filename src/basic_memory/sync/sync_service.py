@@ -8,7 +8,7 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import AsyncIterator, Dict, List, Optional, Set, Tuple
+from typing import AsyncIterator, Awaitable, Callable, Dict, List, Optional, Set, Tuple
 
 import aiofiles.os
 
@@ -18,7 +18,15 @@ from sqlalchemy.exc import IntegrityError
 from basic_memory import telemetry
 from basic_memory import db
 from basic_memory.config import BasicMemoryConfig, ConfigManager
-from basic_memory.file_utils import has_frontmatter
+from basic_memory.file_utils import compute_checksum, has_frontmatter
+from basic_memory.indexing import BatchIndexer, IndexFileMetadata, IndexInputFile, IndexProgress
+from basic_memory.indexing.batching import build_index_batches
+from basic_memory.indexing.models import (
+    IndexedEntity,
+    IndexFileWriter,
+    IndexFrontmatterUpdate,
+    IndexFrontmatterWriteResult,
+)
 from basic_memory.ignore_utils import load_bmignore_patterns, should_ignore_path
 from basic_memory.markdown import EntityParser, MarkdownProcessor
 from basic_memory.models import Entity, Project
@@ -31,7 +39,7 @@ from basic_memory.repository import (
 from basic_memory.repository.search_repository import create_search_repository
 from basic_memory.services import EntityService, FileService
 from basic_memory.repository.semantic_errors import SemanticDependenciesMissingError
-from basic_memory.services.exceptions import SyncFatalError
+from basic_memory.services.exceptions import FileOperationError, SyncFatalError
 from basic_memory.services.link_resolver import LinkResolver
 from basic_memory.services.search_service import SearchService
 
@@ -118,6 +126,23 @@ class ScanResult:
     errors: Dict[str, str] = field(default_factory=dict)
 
 
+class _FileServiceIndexWriter(IndexFileWriter):
+    """Adapt FileService frontmatter updates to the indexing writer protocol."""
+
+    def __init__(self, file_service: FileService) -> None:
+        self.file_service = file_service
+
+    async def write_frontmatter(
+        self, update: IndexFrontmatterUpdate
+    ) -> IndexFrontmatterWriteResult:
+        # Why: IndexFrontmatterWriteResult lives in indexing/models.py so the indexing
+        # layer does not need to import FileService. This adapter keeps that boundary intact.
+        result = await self.file_service.update_frontmatter_with_result(
+            update.path, update.metadata
+        )
+        return IndexFrontmatterWriteResult(checksum=result.checksum, content=result.content)
+
+
 class SyncService:
     """Syncs documents and knowledge files with database."""
 
@@ -146,6 +171,14 @@ class SyncService:
         # Use OrderedDict for LRU behavior with bounded size to prevent unbounded memory growth
         self._file_failures: OrderedDict[str, FileFailureInfo] = OrderedDict()
         self._max_tracked_failures = 100  # Limit failure cache size
+        self.batch_indexer = BatchIndexer(
+            app_config=app_config,
+            entity_service=entity_service,
+            entity_repository=entity_repository,
+            relation_repository=relation_repository,
+            search_service=search_service,
+            file_writer=_FileServiceIndexWriter(file_service),
+        )
 
     async def _should_skip_file(self, path: str) -> bool:
         """Check if file should be skipped due to repeated failures.
@@ -255,7 +288,11 @@ class SyncService:
             del self._file_failures[path]
 
     async def sync(
-        self, directory: Path, project_name: Optional[str] = None, force_full: bool = False
+        self,
+        directory: Path,
+        project_name: Optional[str] = None,
+        force_full: bool = False,
+        progress_callback: Callable[[IndexProgress], Awaitable[None]] | None = None,
     ) -> SyncReport:
         """Sync all files with database and update scan watermark.
 
@@ -263,6 +300,7 @@ class SyncService:
             directory: Directory to sync
             project_name: Optional project name
             force_full: If True, force a full scan bypassing watermark optimization
+            progress_callback: Optional callback for typed indexing progress updates
         """
 
         start_time = time.time()
@@ -310,42 +348,14 @@ class SyncService:
                 for path in report.deleted:
                     await self.handle_delete(path)
 
-                # then new and modified — collect entity IDs for batch vector embedding
-                synced_entity_ids: list[int] = []
-
-                for path in report.new:
-                    entity, _ = await self.sync_file(path, new=True)
-
-                    if entity is not None:
-                        synced_entity_ids.append(entity.id)
-                    # Track if file was skipped
-                    elif await self._should_skip_file(path):
-                        failure_info = self._file_failures[path]
-                        report.skipped_files.append(
-                            SkippedFile(
-                                path=path,
-                                reason=failure_info.last_error,
-                                failure_count=failure_info.count,
-                                first_failed=failure_info.first_failure,
-                            )
-                        )
-
-                for path in report.modified:
-                    entity, _ = await self.sync_file(path, new=False)
-
-                    if entity is not None:
-                        synced_entity_ids.append(entity.id)
-                    # Track if file was skipped
-                    elif await self._should_skip_file(path):
-                        failure_info = self._file_failures[path]
-                        report.skipped_files.append(
-                            SkippedFile(
-                                path=path,
-                                reason=failure_info.last_error,
-                                failure_count=failure_info.count,
-                                first_failed=failure_info.first_failure,
-                            )
-                        )
+                changed_paths = sorted(report.new | report.modified)
+                indexed_entities, skipped_files = await self._index_changed_files(
+                    changed_paths,
+                    report.checksums,
+                    progress_callback=progress_callback,
+                )
+                report.skipped_files.extend(skipped_files)
+                synced_entity_ids = [indexed.entity_id for indexed in indexed_entities]
 
             # Only resolve relations if there were actual changes
             # If no files changed, no new unresolved relations could have been created
@@ -353,11 +363,12 @@ class SyncService:
                 with telemetry.scope(
                     "sync.project.resolve_relations", relation_scope="all_pending"
                 ):
-                    await self.resolve_relations()
+                    synced_entity_ids.extend(await self.resolve_relations())
             else:
                 logger.info("Skipping relation resolution - no file changes detected")
 
             # Batch-generate vector embeddings for all synced entities
+            synced_entity_ids = list(dict.fromkeys(synced_entity_ids))
             if synced_entity_ids and self.app_config.semantic_search_enabled:
                 try:
                     with telemetry.scope(
@@ -424,6 +435,277 @@ class SyncService:
                 )
 
             return report
+
+    async def _index_changed_files(
+        self,
+        changed_paths: list[str],
+        checksums_by_path: dict[str, str],
+        *,
+        progress_callback: Callable[[IndexProgress], Awaitable[None]] | None = None,
+    ) -> tuple[list[IndexedEntity], list[SkippedFile]]:
+        """Load, batch, and index changed files without processing them serially."""
+        if not changed_paths:
+            if progress_callback is not None:
+                await progress_callback(
+                    IndexProgress(
+                        files_total=0,
+                        files_processed=0,
+                        batches_total=0,
+                        batches_completed=0,
+                    )
+                )
+            return [], []
+
+        started_at = time.monotonic()
+        files_total = len(changed_paths)
+        files_processed = 0
+        batches_completed = 0
+        skipped_files: list[SkippedFile] = []
+        skipped_paths: set[str] = set()
+        candidate_paths: list[str] = []
+
+        # Trigger: a file exceeded the retry threshold in a previous sync.
+        # Why: repeated retries on unchanged broken files waste the entire batch budget.
+        # Outcome: skip it up front and still count it in progress.
+        for path in changed_paths:
+            if await self._should_skip_file(path):
+                self._append_skipped_file(path, skipped_files, skipped_paths)
+                files_processed += 1
+            else:
+                candidate_paths.append(path)
+
+        (
+            metadata_by_path,
+            metadata_errors,
+            missing_metadata_paths,
+        ) = await self._load_index_file_metadata(
+            candidate_paths,
+            checksums_by_path,
+        )
+        files_processed += len(missing_metadata_paths)
+        files_processed += len(metadata_errors)
+        for path, error in metadata_errors:
+            await self._record_index_failure(path, error, skipped_files, skipped_paths)
+
+        batch_paths = sorted(metadata_by_path)
+        batches = build_index_batches(
+            batch_paths,
+            metadata_by_path,
+            max_files=self.app_config.index_batch_size,
+            max_bytes=self.app_config.index_batch_max_bytes,
+        )
+
+        await self._emit_index_progress(
+            progress_callback,
+            files_total=files_total,
+            files_processed=files_processed,
+            batches_total=len(batches),
+            batches_completed=0,
+            current_batch_bytes=0,
+            started_at=started_at,
+        )
+
+        indexed_entities: list[IndexedEntity] = []
+        shared_permalink_by_path: dict[str, str | None] | None = None
+        if any(
+            metadata.content_type == "text/markdown"
+            or (
+                metadata.content_type is None
+                and Path(metadata.path).suffix.lower() in {".md", ".markdown"}
+            )
+            for metadata in metadata_by_path.values()
+        ):
+            shared_permalink_by_path = {
+                path: permalink
+                for path, permalink in (
+                    await self.entity_repository.get_file_path_to_permalink_map()
+                ).items()
+            }
+
+        for batch in batches:
+            loaded_files, load_errors = await self._load_index_batch_files(
+                batch.paths, metadata_by_path
+            )
+            for path, error in load_errors:
+                await self._record_index_failure(path, error, skipped_files, skipped_paths)
+
+            if loaded_files:
+                batch_result = await self.batch_indexer.index_files(
+                    loaded_files,
+                    max_concurrent=self.app_config.index_entity_max_concurrent,
+                    parse_max_concurrent=self.app_config.index_parse_max_concurrent,
+                    existing_permalink_by_path=shared_permalink_by_path,
+                )
+                indexed_entities.extend(batch_result.indexed)
+
+                indexed_paths = {indexed.path for indexed in batch_result.indexed}
+                for path in indexed_paths:
+                    self._clear_failure(path)
+
+                for path, error in batch_result.errors:
+                    await self._record_index_failure(path, error, skipped_files, skipped_paths)
+
+            files_processed += len(batch.paths)
+            batches_completed += 1
+            await self._emit_index_progress(
+                progress_callback,
+                files_total=files_total,
+                files_processed=files_processed,
+                batches_total=len(batches),
+                batches_completed=batches_completed,
+                current_batch_bytes=batch.total_bytes,
+                started_at=started_at,
+            )
+
+        return indexed_entities, skipped_files
+
+    async def _load_index_file_metadata(
+        self,
+        paths: list[str],
+        checksums_by_path: dict[str, str],
+    ) -> tuple[dict[str, IndexFileMetadata], list[tuple[str, str]], list[str]]:
+        """Load typed metadata for batch planning before any file content is read."""
+        if not paths:
+            return {}, [], []
+
+        semaphore = asyncio.Semaphore(self.app_config.sync_max_concurrent_files)
+        metadata_by_path: dict[str, IndexFileMetadata] = {}
+        errors: dict[str, str] = {}
+        missing_paths: list[str] = []
+
+        async def load(path: str) -> None:
+            async with semaphore:
+                try:
+                    file_metadata = await self.file_service.get_file_metadata(path)
+                    metadata_by_path[path] = IndexFileMetadata(
+                        path=path,
+                        size=file_metadata.size,
+                        checksum=checksums_by_path.get(path),
+                        content_type=self.file_service.content_type(path),
+                        last_modified=file_metadata.modified_at,
+                        created_at=file_metadata.created_at,
+                    )
+                except FileNotFoundError:
+                    await self.handle_delete(path)
+                    missing_paths.append(path)
+                except Exception as exc:
+                    errors[path] = str(exc)
+
+        await asyncio.gather(*(load(path) for path in paths))
+        return (
+            metadata_by_path,
+            [(path, errors[path]) for path in sorted(errors)],
+            sorted(missing_paths),
+        )
+
+    async def _load_index_batch_files(
+        self,
+        paths: list[str],
+        metadata_by_path: dict[str, IndexFileMetadata],
+    ) -> tuple[dict[str, IndexInputFile], list[tuple[str, str]]]:
+        """Read one batch of file contents into typed input objects."""
+        if not paths:
+            return {}, []
+
+        semaphore = asyncio.Semaphore(self.app_config.sync_max_concurrent_files)
+        files: dict[str, IndexInputFile] = {}
+        errors: dict[str, str] = {}
+
+        async def load(path: str) -> None:
+            async with semaphore:
+                metadata = metadata_by_path[path]
+                try:
+                    content = await self.file_service.read_file_bytes(path)
+                    loaded_checksum = await compute_checksum(content)
+                    files[path] = IndexInputFile(
+                        path=metadata.path,
+                        size=metadata.size,
+                        checksum=loaded_checksum,
+                        content_type=metadata.content_type,
+                        last_modified=metadata.last_modified,
+                        created_at=metadata.created_at,
+                        content=content,
+                    )
+                except FileOperationError as exc:
+                    # Trigger: FileService wraps binary read failures in FileOperationError.
+                    # Why: the service contract should stay consistent for direct callers.
+                    # Outcome: sync still treats wrapped missing-file reads as deletions.
+                    if isinstance(exc.__cause__, FileNotFoundError):
+                        await self.handle_delete(path)
+                    else:
+                        errors[path] = str(exc)
+                except Exception as exc:
+                    errors[path] = str(exc)
+
+        await asyncio.gather(*(load(path) for path in paths))
+        return files, [(path, errors[path]) for path in sorted(errors)]
+
+    async def _record_index_failure(
+        self,
+        path: str,
+        error: str,
+        skipped_files: list[SkippedFile],
+        skipped_paths: set[str],
+    ) -> None:
+        """Record a per-file batch failure and promote it to skipped when threshold is reached."""
+        await self._record_failure(path, error)
+        if await self._should_skip_file(path):
+            self._append_skipped_file(path, skipped_files, skipped_paths)
+
+    def _append_skipped_file(
+        self,
+        path: str,
+        skipped_files: list[SkippedFile],
+        skipped_paths: set[str],
+    ) -> None:
+        """Append one skipped file record once per sync run."""
+        if path in skipped_paths or path not in self._file_failures:
+            return
+
+        failure_info = self._file_failures[path]
+        skipped_files.append(
+            SkippedFile(
+                path=path,
+                reason=failure_info.last_error,
+                failure_count=failure_info.count,
+                first_failed=failure_info.first_failure,
+            )
+        )
+        skipped_paths.add(path)
+
+    async def _emit_index_progress(
+        self,
+        progress_callback: Callable[[IndexProgress], Awaitable[None]] | None,
+        *,
+        files_total: int,
+        files_processed: int,
+        batches_total: int,
+        batches_completed: int,
+        current_batch_bytes: int,
+        started_at: float,
+    ) -> None:
+        """Emit a typed indexing progress update when the caller requested one."""
+        if progress_callback is None:
+            return
+
+        elapsed_seconds = max(time.monotonic() - started_at, 0.001)
+        files_per_minute = files_processed / elapsed_seconds * 60 if files_processed else 0.0
+        eta_seconds = None
+        if files_processed and files_total > files_processed:
+            files_per_second = files_processed / elapsed_seconds
+            eta_seconds = (files_total - files_processed) / files_per_second
+
+        await progress_callback(
+            IndexProgress(
+                files_total=files_total,
+                files_processed=files_processed,
+                batches_total=batches_total,
+                batches_completed=batches_completed,
+                current_batch_bytes=current_batch_bytes,
+                files_per_minute=files_per_minute,
+                eta_seconds=eta_seconds,
+            )
+        )
 
     async def scan(self, directory, force_full: bool = False):
         """Smart scan using watermark and file count for large project optimization.
@@ -1081,13 +1363,17 @@ class SyncService:
             # update search index
             await self.search_service.index_entity(updated)
 
-    async def resolve_relations(self, entity_id: int | None = None):
+    async def resolve_relations(self, entity_id: int | None = None) -> set[int]:
         """Try to resolve unresolved relations.
 
         Args:
             entity_id: If provided, only resolve relations for this specific entity.
                       Otherwise, resolve all unresolved relations in the database.
+
+        Returns:
+            Set of source entity IDs whose outgoing relations changed.
         """
+        affected_entity_ids: set[int] = set()
 
         if entity_id:
             # Only get unresolved relations for the specific entity
@@ -1131,8 +1417,7 @@ class SyncService:
                             "to_name": resolved_entity.title,
                         },
                     )
-                    # update search index only on successful resolution
-                    await self.search_service.index_entity(resolved_entity)
+                    affected_entity_ids.add(relation.from_id)
                 except IntegrityError:
                     with telemetry.scope(
                         "sync.relation.resolve_conflict",
@@ -1164,6 +1449,14 @@ class SyncService:
                                 logger.debug(
                                     f"Could not delete duplicate relation {relation.id}: {e}"
                                 )
+                    affected_entity_ids.add(relation.from_id)
+
+        for affected_entity_id in sorted(affected_entity_ids):
+            source_entity = await self.entity_repository.find_by_id(affected_entity_id)
+            if source_entity is not None:
+                await self.search_service.index_entity(source_entity)
+
+        return affected_entity_ids
 
     async def _quick_count_files(self, directory: Path) -> int:
         """Fast file count using find command.
