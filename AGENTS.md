@@ -22,16 +22,16 @@ See the [README.md](README.md) file for a project overview.
 - Run unit tests (Postgres): `just test-unit-postgres`
 - Run integration tests (SQLite): `just test-int-sqlite`
 - Run integration tests (Postgres): `just test-int-postgres`
-- Run impacted tests: `just testmon` (pytest-testmon)
+- Run impacted tests: `just testmon` (pytest-testmon; only tests affected by changed code)
 - Run MCP smoke test: `just test-smoke`
-- Fast local loop: `just fast-check`
+- Fast local loop: `just fast-check` (default iteration flow)
 - Local consistency check: `just doctor`
 - Generate HTML coverage: `just coverage`
 - Single test: `pytest tests/path/to/test_file.py::test_function_name`
 - Run benchmarks: `pytest test-int/test_sync_performance_benchmark.py -v -m "benchmark and not slow"`
 - Lint: `just lint` or `ruff check . --fix`
-- Type check: `just typecheck` or `uv run pyright`
-- Type check (supplemental): `just typecheck-ty` or `uv run ty check src/`
+- Type check: `just typecheck` or `uv run ty check src tests test-int`
+- Type check (pyright): `just typecheck-pyright` or `uv run pyright`
 - Format: `just format` or `uv run ruff format .`
 - Run all code checks: `just check` (runs lint, format, typecheck, test)
 - Create db migration: `just migration "Your migration message"`
@@ -48,9 +48,11 @@ See the [README.md](README.md) file for a project overview.
 ### Code/Test/Verify Loop (fast path)
 
 1) **Code:** make changes.
-2) **Test:** `just fast-check` (lint/format/typecheck + impacted tests + MCP smoke).
+2) **Test:** `just fast-check` (lint/format/typecheck + pytest-testmon impacted tests for changed code).
 3) **Verify:** `just doctor` (end-to-end file ↔ DB loop in a temp project).
 4) **Full gate (when needed):** `just test` or `just check` for SQLite + Postgres.
+
+Run `just test-smoke` when you specifically need the MCP smoke flow.
 
 If testmon is “cold,” the first run may be long. Subsequent runs get much faster.
 

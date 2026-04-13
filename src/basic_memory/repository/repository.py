@@ -280,9 +280,9 @@ class Repository[T: Base]:
 
                 if isinstance(entity_data, dict):
                     update_data = cast(dict[str, Any], entity_data)
-                    for key, value in update_data.items():
-                        if key in self.valid_columns:
-                            setattr(entity, key, value)
+                    for key in self.valid_columns:
+                        if key in update_data:
+                            setattr(entity, key, update_data[key])
 
                 elif isinstance(entity_data, self.Model):
                     for column in self.valid_columns:

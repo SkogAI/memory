@@ -71,6 +71,12 @@ addopts = "--cov=basic_memory --cov-report term-missing"
 testpaths = ["tests", "test-int"]
 asyncio_mode = "strict"
 asyncio_default_fixture_loop_scope = "function"
+filterwarnings = [
+    "ignore:The @wait_container_is_ready decorator is deprecated.*:DeprecationWarning:testcontainers\\.core\\.waiting_utils",
+    "ignore:The default datetime adapter is deprecated as of Python 3\\.12.*:DeprecationWarning:aiosqlite\\.core",
+    "ignore:codecs\\.open\\(\\) is deprecated\\. Use open\\(\\) instead\\.:DeprecationWarning:frontmatter",
+    "ignore:Parsing dates involving a day of month without a year specified is ambiguous.*:DeprecationWarning:dateparser\\.utils\\.strptime",
+]
 markers = [
     "benchmark: Performance benchmark tests (deselect with '-m \"not benchmark\"')",
     "slow: Slow-running tests (deselect with '-m \"not slow\"')",

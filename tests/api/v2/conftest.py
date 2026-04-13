@@ -14,13 +14,21 @@ from basic_memory.models import Project
 
 
 @pytest_asyncio.fixture
-async def app(test_config, engine_factory, app_config) -> FastAPI:
+async def app(test_config, engine_factory, app_config) -> AsyncGenerator[FastAPI, None]:
     """Create FastAPI test application."""
     from basic_memory.api.app import app
 
+    previous_overrides = dict(app.dependency_overrides)
     app.dependency_overrides[get_app_config] = lambda: app_config
     app.dependency_overrides[get_engine_factory] = lambda: engine_factory
-    return app
+    try:
+        yield app
+    finally:
+        # Trigger: the FastAPI app is a module-level singleton shared across tests.
+        # Why: dependency overrides that capture a per-test engine can leak into
+        # later CLI/MCP tests and create connections outside fixture ownership.
+        # Outcome: each API test leaves the shared app exactly as it found it.
+        app.dependency_overrides = previous_overrides
 
 
 @pytest_asyncio.fixture

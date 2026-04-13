@@ -62,20 +62,20 @@ test-int-postgres:
     fi
 
 # Run tests impacted by recent changes (requires pytest-testmon)
+# Pass paths or node ids after `just testmon` to limit the candidate set further.
 testmon *args:
-    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov --testmon --testmon-forceselect {{args}}
+    BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov --testmon {{args}}
 
 # Run MCP smoke test (fast end-to-end loop)
 test-smoke:
     BASIC_MEMORY_ENV=test uv run pytest -p pytest_mock -v --no-cov -m smoke test-int/mcp/test_smoke_integration.py
 
-# Fast local loop: lint, format, typecheck, impacted tests
+# Fast local loop: lint, format, typecheck, impacted tests via pytest-testmon
 fast-check:
     just fix
     just format
     just typecheck
     just testmon
-    just test-smoke
 
 # Reset Postgres test database (drops and recreates schema)
 # Useful when Alembic migration state gets out of sync during development

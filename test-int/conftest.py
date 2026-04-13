@@ -57,7 +57,12 @@ import pytest
 import pytest_asyncio
 from pathlib import Path
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.pool import NullPool
 from testcontainers.postgres import PostgresContainer
 
@@ -116,6 +121,21 @@ def postgres_container(db_backend):
     # Use pgvector image so CREATE EXTENSION vector succeeds in search repository
     with PostgresContainer("pgvector/pgvector:pg16") as postgres:
         yield postgres
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def cleanup_global_db_after_test() -> AsyncGenerator[None, None]:
+    """Close any module-level DB engine created outside fixture ownership."""
+    yield
+
+    # Trigger: integration tests invoke CLI/MCP routes through the production
+    # client fallback, bypassing this file's engine_factory fixture.
+    # Why: those fallback engines live in basic_memory.db module state and can
+    # otherwise leave a non-daemon aiosqlite worker alive after pytest finishes.
+    # Outcome: every test boundary becomes a cleanup point for fallback engines.
+    from basic_memory import db
+
+    await db.shutdown_db()
 
 
 POSTGRES_EPHEMERAL_TABLES = [
@@ -182,12 +202,36 @@ async def _reset_postgres_integration_schema(engine) -> None:
         )
 
 
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def postgres_engine(
+    db_backend: Literal["sqlite", "postgres"], postgres_container
+) -> AsyncGenerator[AsyncEngine | None, None]:
+    """Create the shared Postgres engine once per integration test session."""
+    if db_backend != "postgres":
+        yield None
+        return
+
+    sync_url = _resolve_postgres_sync_url(postgres_container)
+    async_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
+    engine = create_async_engine(
+        async_url,
+        echo=False,
+        poolclass=NullPool,
+    )
+
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
 @pytest_asyncio.fixture
 async def engine_factory(
     app_config,
     config_manager,
     db_backend: Literal["sqlite", "postgres"],
     postgres_container,
+    postgres_engine,
     tmp_path,
 ) -> AsyncGenerator[tuple, None]:
     """Create engine and session factory for the configured database backend."""
@@ -195,18 +239,17 @@ async def engine_factory(
     from basic_memory import db
 
     if db_backend == "postgres":
-        # Postgres mode using testcontainers
-        sync_url = _resolve_postgres_sync_url(postgres_container)
-        async_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
+        assert postgres_engine is not None
 
-        engine = create_async_engine(
-            async_url,
-            echo=False,
-            poolclass=NullPool,
-        )
+        # Trigger: full-stack MCP/CLI tests exercise sync/indexing code that can
+        # recover from DB errors by rolling back and opening later scoped sessions.
+        # Why: one savepoint-backed connection is too brittle for that flow.
+        # Outcome: reuse the engine, but reset rows/schema before each test and
+        # let app code use normal transaction boundaries.
+        await _reset_postgres_integration_schema(postgres_engine)
 
         session_maker = async_sessionmaker(
-            bind=engine,
+            bind=postgres_engine,
             class_=AsyncSession,
             expire_on_commit=False,
             autoflush=False,
@@ -214,17 +257,17 @@ async def engine_factory(
 
         # Set module-level state to prevent MCP lifespan from re-initializing
         # This ensures get_or_create_db() sees an existing engine and skips initialization
-        db._engine = engine
+        db._engine = postgres_engine
         db._session_maker = session_maker
 
-        await _reset_postgres_integration_schema(engine)
-
-        yield engine, session_maker
-
-        # Clean up module-level state
-        await engine.dispose()
-        db._engine = None
-        db._session_maker = None
+        try:
+            yield postgres_engine, session_maker
+        finally:
+            # Clean up module-level state
+            if db._engine is postgres_engine:
+                db._engine = None
+            if db._session_maker is session_maker:
+                db._session_maker = None
 
     else:
         # SQLite: Create fresh database (fast with tmp files)

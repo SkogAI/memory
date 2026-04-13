@@ -8,6 +8,7 @@ SearchService for each (backend, provider) combination.
 from __future__ import annotations
 
 import os
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,7 +16,12 @@ import pytest
 import pytest_asyncio
 from dotenv import load_dotenv
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from sqlalchemy.pool import NullPool
 from testcontainers.postgres import PostgresContainer
 
@@ -152,25 +158,8 @@ async def sqlite_engine_factory(tmp_path):
         yield engine, session_maker
 
 
-@pytest_asyncio.fixture
-async def postgres_engine_factory(pgvector_container):
-    """Create a Postgres engine + session factory with pgvector extension."""
-    if pgvector_container is None:
-        yield None
-        return
-
-    sync_url = pgvector_container.get_connection_url()
-    async_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
-
-    engine = create_async_engine(async_url, echo=False, poolclass=NullPool)
-    session_maker = async_sessionmaker(
-        bind=engine,
-        class_=AsyncSession,
-        expire_on_commit=False,
-        autoflush=False,
-    )
-
-    # Create schema from scratch for each test
+async def _reset_postgres_semantic_schema(engine: AsyncEngine) -> None:
+    """Reset the semantic Postgres schema to a clean baseline."""
     async with engine.begin() as conn:
         await conn.execute(text("DROP TABLE IF EXISTS search_vector_embeddings CASCADE"))
         await conn.execute(text("DROP TABLE IF EXISTS search_vector_chunks CASCADE"))
@@ -182,9 +171,47 @@ async def postgres_engine_factory(pgvector_container):
         await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_METADATA)
         await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_PERMALINK)
 
-    yield engine, session_maker
 
-    await engine.dispose()
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def postgres_engine(pgvector_container) -> AsyncGenerator[AsyncEngine | None, None]:
+    """Create the shared semantic Postgres engine once per test session."""
+    if pgvector_container is None:
+        yield None
+        return
+
+    sync_url = pgvector_container.get_connection_url()
+    async_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
+
+    engine = create_async_engine(async_url, echo=False, poolclass=NullPool)
+
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
+@pytest_asyncio.fixture
+async def postgres_engine_factory(postgres_engine):
+    """Create a Postgres session factory isolated by schema reset."""
+    if postgres_engine is None:
+        yield None
+        return
+
+    # Trigger: semantic provider combos create and rebuild vector tables.
+    # Why: the main suite showed savepoint-bound shared connections can get
+    # poisoned by app-level rollback/recovery paths.
+    # Outcome: keep the pgvector engine warm, but reset schema per test and let
+    # repository code use normal Postgres transactions.
+    await _reset_postgres_semantic_schema(postgres_engine)
+
+    session_maker = async_sessionmaker(
+        bind=postgres_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+        autoflush=False,
+    )
+
+    yield postgres_engine, session_maker
 
 
 # --- Embedding provider factories ---

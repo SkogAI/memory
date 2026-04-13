@@ -146,7 +146,7 @@ def _resolve_postgres_sync_url(postgres_container) -> str:
 
 
 async def _reset_postgres_test_schema(engine: AsyncEngine, async_url: str) -> None:
-    """Restore the shared Postgres schema to a clean baseline before each test."""
+    """Restore the shared Postgres schema to a clean baseline."""
     from basic_memory.models.search import (
         CREATE_POSTGRES_SEARCH_INDEX_FTS,
         CREATE_POSTGRES_SEARCH_INDEX_METADATA,
@@ -183,6 +183,29 @@ async def _reset_postgres_test_schema(engine: AsyncEngine, async_url: str) -> No
         command.stamp(_postgres_alembic_config(async_url), "head")
 
 
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def postgres_engine(
+    db_backend, postgres_container
+) -> AsyncGenerator[AsyncEngine | None, None]:
+    """Create the shared Postgres engine once per test session."""
+    if db_backend != "postgres":
+        yield None
+        return
+
+    sync_url = _resolve_postgres_sync_url(postgres_container)
+    async_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
+    engine = create_async_engine(
+        async_url,
+        echo=False,
+        poolclass=NullPool,
+    )
+
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
@@ -192,6 +215,19 @@ def anyio_backend():
 def suppress_logfire_no_config_warning(monkeypatch) -> None:
     """Keep tests focused on behavior instead of Logfire bootstrap warnings."""
     monkeypatch.setenv("LOGFIRE_IGNORE_NO_CONFIG", "1")
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def cleanup_global_db_after_test() -> AsyncGenerator[None, None]:
+    """Close any module-level DB engine created outside fixture ownership."""
+    yield
+
+    # Trigger: a test exercises production fallback routing instead of the
+    # per-test engine fixture.
+    # Why: that path stores an engine in basic_memory.db module state, and
+    # a later fixture can overwrite the reference before it is disposed.
+    # Outcome: close straggler aiosqlite worker threads before the loop closes.
+    await db.shutdown_db()
 
 
 @pytest.fixture
@@ -293,6 +329,7 @@ async def engine_factory(
     config_manager,
     db_backend,
     postgres_container,
+    postgres_engine,
 ) -> AsyncGenerator[tuple[AsyncEngine, async_sessionmaker[AsyncSession]], None]:
     """Engine factory for SQLite or Postgres tests.
 
@@ -306,19 +343,20 @@ async def engine_factory(
     )
 
     if db_backend == "postgres":
-        # Postgres mode using testcontainers
-        # Get async connection URL (asyncpg driver - same as production)
+        assert postgres_engine is not None
         sync_url = _resolve_postgres_sync_url(postgres_container)
         async_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
 
-        engine = create_async_engine(
-            async_url,
-            echo=False,
-            poolclass=NullPool,  # NullPool for better test isolation
-        )
+        # Trigger: Basic Memory sync/indexing paths can catch database errors,
+        # roll back, and continue through new scoped sessions.
+        # Why: binding every scoped session to one savepoint-backed connection can
+        # leave that connection in PendingRollbackError state for later sessions.
+        # Outcome: keep the session-scoped engine, but use normal Postgres
+        # transaction semantics and reset rows/schema between tests.
+        await _reset_postgres_test_schema(postgres_engine, async_url)
 
         session_maker = async_sessionmaker(
-            bind=engine,
+            bind=postgres_engine,
             class_=AsyncSession,
             expire_on_commit=False,
             autoflush=False,
@@ -328,16 +366,16 @@ async def engine_factory(
         # Some codepaths (e.g. app initialization / MCP lifespan) call db.get_or_create_db(),
         # which would otherwise create a separate engine and run migrations, conflicting with
         # our test-created schema (and causing DuplicateTableError).
-        db._engine = engine
+        db._engine = postgres_engine
         db._session_maker = session_maker
 
-        await _reset_postgres_test_schema(engine, async_url)
-
-        yield engine, session_maker
-
-        await engine.dispose()
-        db._engine = None
-        db._session_maker = None
+        try:
+            yield postgres_engine, session_maker
+        finally:
+            if db._engine is postgres_engine:
+                db._engine = None
+            if db._session_maker is session_maker:
+                db._session_maker = None
     else:
         # SQLite mode
         db_type = DatabaseType.MEMORY
