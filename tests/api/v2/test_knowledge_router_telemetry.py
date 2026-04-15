@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from typing import Any, cast
 
 import pytest
-from fastapi import BackgroundTasks, Response
+from fastapi import Response
 
 from basic_memory.schemas.base import Entity
 from basic_memory.schemas.request import EditEntityRequest
@@ -48,14 +48,12 @@ def _fake_entity(*, external_id: str = "entity-123", file_path: str = "notes/tes
     )
 
 
-def _assert_names_in_order(names: list[str], expected: list[str]) -> None:
-    cursor = 0
-    for expected_name in expected:
-        cursor = names.index(expected_name, cursor) + 1
+def _assert_only_root_span(spans: list[tuple[str, dict]], expected_name: str) -> None:
+    assert [name for name, _ in spans] == [expected_name]
 
 
 @pytest.mark.asyncio
-async def test_create_entity_emits_root_and_nested_spans(monkeypatch) -> None:
+async def test_create_entity_emits_only_root_span(monkeypatch) -> None:
     spans, fake_span = _capture_spans()
     monkeypatch.setattr(knowledge_router_module.telemetry, "span", fake_span)
 
@@ -81,10 +79,6 @@ async def test_create_entity_emits_root_and_nested_spans(monkeypatch) -> None:
         def schedule(self, *args, **kwargs):
             return None
 
-    class FakeFileService:
-        async def read_file_content(self, path):
-            raise AssertionError("non-fast create should not re-read file content")
-
     result = await knowledge_router_module.create_entity(
         project_id=123,
         data=Entity(
@@ -94,30 +88,18 @@ async def test_create_entity_emits_root_and_nested_spans(monkeypatch) -> None:
             content_type="text/markdown",
             content="telemetry content",
         ),
-        background_tasks=BackgroundTasks(),
         entity_service=cast(Any, FakeEntityService()),
         search_service=cast(Any, FakeSearchService()),
         task_scheduler=FakeTaskScheduler(),
-        file_service=cast(Any, FakeFileService()),
         app_config=cast(Any, SimpleNamespace(semantic_search_enabled=False)),
-        fast=False,
     )
 
     assert result.content == response_content
-    _assert_names_in_order(
-        [name for name, _ in spans],
-        [
-            "api.request.knowledge.create_entity",
-            "api.knowledge.create_entity.write_entity",
-            "api.knowledge.create_entity.search_index",
-            "api.knowledge.create_entity.vector_sync",
-            "api.knowledge.create_entity.read_content",
-        ],
-    )
+    _assert_only_root_span(spans, "api.request.knowledge.create_entity")
 
 
 @pytest.mark.asyncio
-async def test_update_entity_emits_root_and_nested_spans(monkeypatch) -> None:
+async def test_update_entity_emits_only_root_span(monkeypatch) -> None:
     spans, fake_span = _capture_spans()
     monkeypatch.setattr(knowledge_router_module.telemetry, "span", fake_span)
 
@@ -145,10 +127,6 @@ async def test_update_entity_emits_root_and_nested_spans(monkeypatch) -> None:
         def schedule(self, *args, **kwargs):
             return None
 
-    class FakeFileService:
-        async def read_file_content(self, path):
-            raise AssertionError("non-fast update should not re-read file content")
-
     response = Response()
     result = await knowledge_router_module.update_entity_by_id(
         data=Entity(
@@ -159,34 +137,21 @@ async def test_update_entity_emits_root_and_nested_spans(monkeypatch) -> None:
             content="updated telemetry content",
         ),
         response=response,
-        background_tasks=BackgroundTasks(),
         project_id=123,
         entity_service=cast(Any, FakeEntityService()),
         search_service=cast(Any, FakeSearchService()),
         entity_repository=cast(Any, FakeEntityRepository()),
         task_scheduler=FakeTaskScheduler(),
-        file_service=cast(Any, FakeFileService()),
         app_config=cast(Any, SimpleNamespace(semantic_search_enabled=False)),
         entity_id=entity.external_id,
-        fast=False,
     )
 
     assert result.content == response_content
-    _assert_names_in_order(
-        [name for name, _ in spans],
-        [
-            "api.request.knowledge.update_entity",
-            "api.knowledge.update_entity.load_entity",
-            "api.knowledge.update_entity.write_entity",
-            "api.knowledge.update_entity.search_index",
-            "api.knowledge.update_entity.vector_sync",
-            "api.knowledge.update_entity.read_content",
-        ],
-    )
+    _assert_only_root_span(spans, "api.request.knowledge.update_entity")
 
 
 @pytest.mark.asyncio
-async def test_edit_entity_emits_root_and_nested_spans(monkeypatch) -> None:
+async def test_edit_entity_emits_only_root_span(monkeypatch) -> None:
     spans, fake_span = _capture_spans()
     monkeypatch.setattr(knowledge_router_module.telemetry, "span", fake_span)
 
@@ -214,33 +179,16 @@ async def test_edit_entity_emits_root_and_nested_spans(monkeypatch) -> None:
         def schedule(self, *args, **kwargs):
             return None
 
-    class FakeFileService:
-        async def read_file_content(self, path):
-            raise AssertionError("non-fast edit should not re-read file content")
-
     result = await knowledge_router_module.edit_entity_by_id(
         data=EditEntityRequest(operation="append", content="edited telemetry content"),
-        background_tasks=BackgroundTasks(),
         project_id=123,
         entity_service=cast(Any, FakeEntityService()),
         search_service=cast(Any, FakeSearchService()),
         entity_repository=cast(Any, FakeEntityRepository()),
         task_scheduler=FakeTaskScheduler(),
-        file_service=cast(Any, FakeFileService()),
         app_config=cast(Any, SimpleNamespace(semantic_search_enabled=False)),
         entity_id=entity.external_id,
-        fast=False,
     )
 
     assert result.content == response_content
-    _assert_names_in_order(
-        [name for name, _ in spans],
-        [
-            "api.request.knowledge.edit_entity",
-            "api.knowledge.edit_entity.load_entity",
-            "api.knowledge.edit_entity.write_entity",
-            "api.knowledge.edit_entity.search_index",
-            "api.knowledge.edit_entity.vector_sync",
-            "api.knowledge.edit_entity.read_content",
-        ],
-    )
+    _assert_only_root_span(spans, "api.request.knowledge.edit_entity")
