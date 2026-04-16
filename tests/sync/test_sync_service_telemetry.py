@@ -4,12 +4,16 @@ from __future__ import annotations
 
 import importlib
 from contextlib import contextmanager
+from pathlib import Path
+from textwrap import dedent
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 
 from basic_memory.sync.sync_service import SyncReport
 
+batch_indexer_module = importlib.import_module("basic_memory.indexing.batch_indexer")
 sync_service_module = importlib.import_module("basic_memory.sync.sync_service")
 
 
@@ -28,6 +32,14 @@ def _capture_sync_telemetry():
         yield
 
     return operations, spans, fake_operation, fake_span
+
+
+def _write_markdown(project_root: Path, relative_path: str, content: str) -> Path:
+    """Create one markdown file under the test project."""
+    file_path = project_root / relative_path
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    file_path.write_text(content, encoding="utf-8")
+    return file_path
 
 
 @pytest.mark.asyncio
@@ -95,6 +107,47 @@ async def test_sync_emits_phase_spans(sync_service, project_config, monkeypatch)
         "sync.project.resolve_relations",
         "sync.project.update_watermark",
     ]
+
+
+@pytest.mark.asyncio
+async def test_sync_one_markdown_file_emits_index_phase_spans(
+    sync_service, test_project, monkeypatch
+) -> None:
+    _, spans, _, fake_span = _capture_sync_telemetry()
+    monkeypatch.setattr(batch_indexer_module.telemetry, "span", fake_span)
+    monkeypatch.setattr(sync_service.search_service, "index_entity_data", AsyncMock())
+
+    _write_markdown(
+        Path(test_project.path),
+        "notes/telemetry.md",
+        dedent(
+            f"""\
+            ---
+            title: Telemetry Note
+            type: note
+            permalink: {test_project.name}/notes/telemetry
+            ---
+
+            # Telemetry Note
+
+            Body content.
+            """
+        ),
+    )
+
+    result = await sync_service.sync_one_markdown_file("notes/telemetry.md")
+
+    index_spans = [(name, attrs) for name, attrs in spans if name.startswith("index.markdown_file")]
+    assert [name for name, _ in index_spans] == [
+        "index.markdown_file.prepare",
+        "index.markdown_file.load_permalink_map",
+        "index.markdown_file.normalize",
+        "index.markdown_file.persist",
+        "index.markdown_file.reload_entity",
+    ]
+    assert index_spans[0][1] == {"path": "notes/telemetry.md"}
+    assert index_spans[3][1] == {"path": "notes/telemetry.md", "is_new": True}
+    assert index_spans[4][1]["entity_id"] == result.entity.id
 
 
 @pytest.mark.asyncio
