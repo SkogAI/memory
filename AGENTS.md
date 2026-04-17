@@ -29,6 +29,7 @@ See the [README.md](README.md) file for a project overview.
 - Generate HTML coverage: `just coverage`
 - Single test: `pytest tests/path/to/test_file.py::test_function_name`
 - Run benchmarks: `pytest test-int/test_sync_performance_benchmark.py -v -m "benchmark and not slow"`
+- Run semantic search tests: `just test-semantic` (or `just test-semantic-postgres`)
 - Lint: `just lint` or `ruff check . --fix`
 - Type check: `just typecheck` or `uv run ty check src tests test-int`
 - Type check (pyright): `just typecheck-pyright` or `uv run pyright`
@@ -140,19 +141,22 @@ counter += 1  # track retries for backoff calculation
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for detailed architecture documentation.
 
-**Directory Structure:**
+**Directory Structure (`src/basic_memory/`):**
 - `/alembic` - Alembic db migrations
-- `/api` - FastAPI REST endpoints + `container.py` composition root
+- `/api` - FastAPI REST endpoints + `container.py` composition root (`v2/` for v2 endpoints)
 - `/cli` - Typer CLI + `container.py` composition root
 - `/deps` - Feature-scoped FastAPI dependencies (config, db, projects, repositories, services, importers)
 - `/importers` - Import functionality for Claude, ChatGPT, and other sources
+- `/indexing` - Batch file indexing for sync performance (`batch_indexer.py`, `batching.py`)
 - `/markdown` - Markdown parsing and processing
-- `/mcp` - MCP server + `container.py` composition root + `clients/` typed API clients
+- `/mcp` - MCP server + `container.py` composition root + `clients/` typed API clients + `ui/` MCP UI resources
 - `/models` - SQLAlchemy ORM models
 - `/repository` - Data access layer
 - `/schemas` - Pydantic models for validation
-- `/services` - Business logic layer
-- `/sync` - File synchronization services + `coordinator.py` for lifecycle management
+- `/services` - Business logic layer (includes vector/semantic search services)
+- `/sync` - File synchronization services + `coordinator.py` for lifecycle management + `background_sync.py` for non-blocking startup
+- `/templates` - Jinja templates for prompts and UI
+- Top-level: `config.py`, `db.py`, `runtime.py` (RuntimeMode enum), `project_resolver.py`, `telemetry.py`, `ignore_utils.py`
 
 **Composition Roots:**
 Each entrypoint (API, MCP, CLI) has a composition root that:
@@ -387,6 +391,7 @@ Key behaviors:
 - This allows simultaneous use of local Claude Desktop and cloud-based clients
 - Some commands (like `project default`, `project sync-config`, `project move`) require `--local` in cloud mode since they modify local configuration
 - Environment variable `BASIC_MEMORY_FORCE_LOCAL=true` forces local routing globally
+- Environment variable `BASIC_MEMORY_CONFIG_DIR` overrides the default config directory (honored across all call sites; useful for tests and isolated environments)
 - Per-project cloud routing via API key works independently of global cloud mode
 
 ## AI-Human Collaborative Development
