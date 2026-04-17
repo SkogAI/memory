@@ -2,8 +2,7 @@
 
 import logging
 from datetime import datetime
-from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from basic_memory.markdown.schemas import EntityFrontmatter, EntityMarkdown
 from basic_memory.importers.base import Importer
@@ -15,6 +14,19 @@ logger = logging.getLogger(__name__)
 
 class ClaudeConversationsImporter(Importer[ChatImportResult]):
     """Service for importing Claude conversations."""
+
+    def handle_error(  # pragma: no cover
+        self, message: str, error: Optional[Exception] = None
+    ) -> ChatImportResult:
+        """Return a failed ChatImportResult with an error message."""
+        error_msg = f"{message}: {error}" if error else message
+        return ChatImportResult(
+            import_count={},
+            success=False,
+            error_message=error_msg,
+            conversations=0,
+            messages=0,
+        )
 
     async def import_data(
         self, source_data, destination_folder: str, **kwargs: Any
@@ -31,7 +43,7 @@ class ClaudeConversationsImporter(Importer[ChatImportResult]):
         """
         try:
             # Ensure the destination folder exists
-            folder_path = self.ensure_folder_exists(destination_folder)
+            await self.ensure_folder_exists(destination_folder)
 
             conversations = source_data
 
@@ -40,17 +52,29 @@ class ClaudeConversationsImporter(Importer[ChatImportResult]):
             chats_imported = 0
 
             for chat in conversations:
+                # Get name, providing default for unnamed conversations
+                chat_name = chat.get("name") or f"Conversation {chat.get('uuid', 'untitled')}"
+                date_prefix = datetime.fromisoformat(
+                    chat["created_at"].replace("Z", "+00:00")
+                ).strftime("%Y%m%d")
+                clean_title = clean_filename(chat_name)
+                relative_path = (
+                    f"{destination_folder}/{date_prefix}-{clean_title}"
+                    if destination_folder
+                    else f"{date_prefix}-{clean_title}"
+                )
+                permalink, file_path = self.build_import_paths(relative_path)
+
                 # Convert to entity
                 entity = self._format_chat_content(
-                    base_path=folder_path,
-                    name=chat["name"],
+                    name=chat_name,
                     messages=chat["chat_messages"],
                     created_at=chat["created_at"],
                     modified_at=chat["updated_at"],
+                    permalink=permalink,
                 )
 
-                # Write file
-                file_path = self.base_path / Path(f"{entity.frontmatter.metadata['permalink']}.md")
+                # Write file using relative path - FileService handles base_path
                 await self.write_entity(entity, file_path)
 
                 chats_imported += 1
@@ -65,20 +89,20 @@ class ClaudeConversationsImporter(Importer[ChatImportResult]):
 
         except Exception as e:  # pragma: no cover
             logger.exception("Failed to import Claude conversations")
-            return self.handle_error("Failed to import Claude conversations", e)  # pyright: ignore [reportReturnType]
+            return self.handle_error("Failed to import Claude conversations", e)
 
     def _format_chat_content(
         self,
-        base_path: Path,
         name: str,
         messages: List[Dict[str, Any]],
         created_at: str,
         modified_at: str,
+        permalink: str,
     ) -> EntityMarkdown:
         """Convert chat messages to Basic Memory entity format.
 
         Args:
-            base_path: Base path for the entity.
+            folder: Destination folder name (relative path).
             name: Chat name.
             messages: List of chat messages.
             created_at: Creation timestamp.
@@ -87,11 +111,6 @@ class ClaudeConversationsImporter(Importer[ChatImportResult]):
         Returns:
             EntityMarkdown instance representing the conversation.
         """
-        # Generate permalink
-        date_prefix = datetime.fromisoformat(created_at.replace("Z", "+00:00")).strftime("%Y%m%d")
-        clean_title = clean_filename(name)
-        permalink = f"{base_path.name}/{date_prefix}-{clean_title}"
-
         # Format content
         content = self._format_chat_markdown(
             name=name,
@@ -153,7 +172,12 @@ class ClaudeConversationsImporter(Importer[ChatImportResult]):
             # Handle message content
             content = msg.get("text", "")
             if msg.get("content"):
-                content = " ".join(c.get("text", "") for c in msg["content"])
+                # Filter out None values before joining
+                content = " ".join(
+                    str(c.get("text", ""))
+                    for c in msg["content"]
+                    if c and c.get("text") is not None
+                )
             lines.append(content)
 
             # Handle attachments

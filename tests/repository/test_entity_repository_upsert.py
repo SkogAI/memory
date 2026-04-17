@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from basic_memory.models.knowledge import Entity
 from basic_memory.repository.entity_repository import EntityRepository
 from basic_memory.repository.project_repository import ProjectRepository
+from basic_memory.services.exceptions import SyncFatalError
 
 
 @pytest.mark.asyncio
@@ -14,7 +15,7 @@ async def test_upsert_entity_new_entity(entity_repository: EntityRepository):
     entity = Entity(
         project_id=entity_repository.project_id,
         title="Test Entity",
-        entity_type="note",
+        note_type="note",
         permalink="test/test-entity",
         file_path="test/test-entity.md",
         content_type="text/markdown",
@@ -37,7 +38,7 @@ async def test_upsert_entity_same_file_update(entity_repository: EntityRepositor
     entity1 = Entity(
         project_id=entity_repository.project_id,
         title="Original Title",
-        entity_type="note",
+        note_type="note",
         permalink="test/test-entity",
         file_path="test/test-entity.md",
         content_type="text/markdown",
@@ -52,7 +53,7 @@ async def test_upsert_entity_same_file_update(entity_repository: EntityRepositor
     entity2 = Entity(
         project_id=entity_repository.project_id,
         title="Updated Title",
-        entity_type="note",
+        note_type="note",
         permalink="test/test-entity",  # Same permalink
         file_path="test/test-entity.md",  # Same file_path
         content_type="text/markdown",
@@ -70,13 +71,57 @@ async def test_upsert_entity_same_file_update(entity_repository: EntityRepositor
 
 
 @pytest.mark.asyncio
+async def test_upsert_entity_preserves_external_id(entity_repository: EntityRepository):
+    """Test that upserting an entity with the same file_path preserves the original external_id.
+
+    Trigger: force full re-index creates a new Entity model (with a fresh UUID)
+             for a file that already has a database record
+    Why: external_id is used by public share links — if it changes, shares break
+    Outcome: the original external_id survives the upsert
+    """
+    # Create initial entity
+    entity1 = Entity(
+        project_id=entity_repository.project_id,
+        title="Shared Note",
+        note_type="note",
+        permalink="test/shared-note",
+        file_path="test/shared-note.md",
+        content_type="text/markdown",
+        external_id="original-stable-id",
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    result1 = await entity_repository.upsert_entity(entity1)
+    assert result1.external_id == "original-stable-id"
+
+    # Simulate re-index: new Entity model with a DIFFERENT external_id
+    entity2 = Entity(
+        project_id=entity_repository.project_id,
+        title="Shared Note (updated)",
+        note_type="note",
+        permalink="test/shared-note",
+        file_path="test/shared-note.md",
+        content_type="text/markdown",
+        external_id="newly-generated-uuid",  # would break share links
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+    result2 = await entity_repository.upsert_entity(entity2)
+
+    # ID preserved, title updated, external_id stable
+    assert result2.id == result1.id
+    assert result2.title == "Shared Note (updated)"
+    assert result2.external_id == "original-stable-id"
+
+
+@pytest.mark.asyncio
 async def test_upsert_entity_permalink_conflict_different_file(entity_repository: EntityRepository):
     """Test upserting an entity with permalink conflict but different file_path."""
     # Create initial entity
     entity1 = Entity(
         project_id=entity_repository.project_id,
         title="First Entity",
-        entity_type="note",
+        note_type="note",
         permalink="test/shared-permalink",
         file_path="test/first-file.md",
         content_type="text/markdown",
@@ -91,7 +136,7 @@ async def test_upsert_entity_permalink_conflict_different_file(entity_repository
     entity2 = Entity(
         project_id=entity_repository.project_id,
         title="Second Entity",
-        entity_type="note",
+        note_type="note",
         permalink="test/shared-permalink",  # Same permalink
         file_path="test/second-file.md",  # Different file_path
         content_type="text/markdown",
@@ -125,7 +170,7 @@ async def test_upsert_entity_multiple_permalink_conflicts(entity_repository: Ent
         entity = Entity(
             project_id=entity_repository.project_id,
             title=f"Entity {i + 1}",
-            entity_type="note",
+            note_type="note",
             permalink=base_permalink,  # All try to use same permalink
             file_path=f"test/file-{i + 1}.md",  # Different file paths
             content_type="text/markdown",
@@ -149,15 +194,17 @@ async def test_upsert_entity_multiple_permalink_conflicts(entity_repository: Ent
 
 @pytest.mark.asyncio
 async def test_upsert_entity_race_condition_file_path(entity_repository: EntityRepository):
-    """Test that upsert handles race condition where file_path conflict occurs after initial check."""
-    from unittest.mock import patch
-    from sqlalchemy.exc import IntegrityError
+    """Test that upsert handles file_path conflicts using ON CONFLICT DO UPDATE.
 
+    With SQLite's ON CONFLICT, race conditions are handled at the database level
+    without requiring application-level checks. This test verifies that updating
+    an existing entity by file_path works correctly.
+    """
     # Create an entity first
     entity1 = Entity(
         project_id=entity_repository.project_id,
         title="Original Entity",
-        entity_type="note",
+        note_type="note",
         permalink="test/original",
         file_path="test/race-file.md",
         content_type="text/markdown",
@@ -168,42 +215,27 @@ async def test_upsert_entity_race_condition_file_path(entity_repository: EntityR
     result1 = await entity_repository.upsert_entity(entity1)
     original_id = result1.id
 
-    # Create another entity with different file_path and permalink
+    # Create another entity with same file_path but different title and permalink
+    # This simulates a concurrent update scenario
     entity2 = Entity(
         project_id=entity_repository.project_id,
         title="Race Condition Test",
-        entity_type="note",
+        note_type="note",
         permalink="test/race-entity",
-        file_path="test/different-file.md",  # Different initially
+        file_path="test/race-file.md",  # Same file path as entity1
         content_type="text/markdown",
         created_at=datetime.now(timezone.utc),
         updated_at=datetime.now(timezone.utc),
     )
 
-    # Now simulate race condition: change file_path to conflict after the initial check
-    original_add = entity_repository.session_maker().add
-    call_count = 0
+    # ON CONFLICT should update the existing entity
+    result2 = await entity_repository.upsert_entity(entity2)
 
-    def mock_add(obj):
-        nonlocal call_count
-        if isinstance(obj, Entity) and call_count == 0:
-            call_count += 1
-            # Simulate race condition by changing file_path to conflict
-            obj.file_path = "test/race-file.md"  # Same as entity1
-            # This should trigger IntegrityError for file_path constraint
-            raise IntegrityError("UNIQUE constraint failed: entity.file_path", None, None)
-        return original_add(obj)
-
-    # Mock session.add to simulate the race condition
-    with patch.object(entity_repository.session_maker().__class__, "add", side_effect=mock_add):
-        # This should handle the race condition gracefully by updating the existing entity
-        result2 = await entity_repository.upsert_entity(entity2)
-
-        # Should return the updated original entity (same ID)
-        assert result2.id == original_id
-        assert result2.title == "Race Condition Test"  # Updated title
-        assert result2.file_path == "test/race-file.md"  # Same file path
-        assert result2.permalink == "test/race-entity"  # Updated permalink
+    # Should return the updated original entity (same ID)
+    assert result2.id == original_id
+    assert result2.title == "Race Condition Test"  # Updated title
+    assert result2.file_path == "test/race-file.md"  # Same file path
+    assert result2.permalink == "test/race-entity"  # Updated permalink
 
 
 @pytest.mark.asyncio
@@ -220,7 +252,7 @@ async def test_upsert_entity_gap_in_suffixes(entity_repository: EntityRepository
         entity = Entity(
             project_id=entity_repository.project_id,
             title=f"Entity {i + 1}",
-            entity_type="note",
+            note_type="note",
             permalink=permalink,
             file_path=f"test/gap-file-{i + 1}.md",
             content_type="text/markdown",
@@ -233,7 +265,7 @@ async def test_upsert_entity_gap_in_suffixes(entity_repository: EntityRepository
     new_entity = Entity(
         project_id=entity_repository.project_id,
         title="Gap Filler",
-        entity_type="note",
+        note_type="note",
         permalink=base_permalink,  # Will conflict
         file_path="test/gap-new-file.md",
         content_type="text/markdown",
@@ -287,7 +319,7 @@ async def test_upsert_entity_project_scoping_isolation(session_maker):
     entity1 = Entity(
         project_id=project1.id,
         title="Shared Entity",
-        entity_type="note",
+        note_type="note",
         permalink="docs/shared-name",
         file_path="docs/shared-name.md",
         content_type="text/markdown",
@@ -298,7 +330,7 @@ async def test_upsert_entity_project_scoping_isolation(session_maker):
     entity2 = Entity(
         project_id=project2.id,
         title="Shared Entity",
-        entity_type="note",
+        note_type="note",
         permalink="docs/shared-name",  # Same permalink
         file_path="docs/shared-name.md",  # Same file_path
         content_type="text/markdown",
@@ -323,7 +355,7 @@ async def test_upsert_entity_project_scoping_isolation(session_maker):
     entity1_update = Entity(
         project_id=project1.id,
         title="Updated Shared Entity",
-        entity_type="note",
+        note_type="note",
         permalink="docs/shared-name",
         file_path="docs/shared-name.md",
         content_type="text/markdown",
@@ -334,7 +366,7 @@ async def test_upsert_entity_project_scoping_isolation(session_maker):
     entity2_update = Entity(
         project_id=project2.id,
         title="Also Updated Shared Entity",
-        entity_type="note",
+        note_type="note",
         permalink="docs/shared-name",
         file_path="docs/shared-name.md",
         content_type="text/markdown",
@@ -401,7 +433,7 @@ async def test_upsert_entity_permalink_conflict_within_project_only(session_make
     entity1 = Entity(
         project_id=project1.id,
         title="Original Entity",
-        entity_type="note",
+        note_type="note",
         permalink="test/conflict-permalink",
         file_path="test/original.md",
         content_type="text/markdown",
@@ -416,7 +448,7 @@ async def test_upsert_entity_permalink_conflict_within_project_only(session_make
     entity2 = Entity(
         project_id=project2.id,
         title="Cross-Project Entity",
-        entity_type="note",
+        note_type="note",
         permalink="test/conflict-permalink",  # Same permalink, different project
         file_path="test/cross-project.md",
         content_type="text/markdown",
@@ -432,7 +464,7 @@ async def test_upsert_entity_permalink_conflict_within_project_only(session_make
     entity3 = Entity(
         project_id=project1.id,
         title="Conflict Entity",
-        entity_type="note",
+        note_type="note",
         permalink="test/conflict-permalink",  # Same permalink, same project
         file_path="test/conflict.md",
         content_type="text/markdown",
@@ -449,3 +481,32 @@ async def test_upsert_entity_permalink_conflict_within_project_only(session_make
     assert result1.project_id == project1.id
     assert result2.project_id == project2.id
     assert result3.project_id == project1.id
+
+
+@pytest.mark.asyncio
+async def test_upsert_entity_with_invalid_project_id(entity_repository: EntityRepository):
+    """Test that upserting with non-existent project_id raises clear error.
+
+    This tests the fix for issue #188 where sync fails with FOREIGN KEY constraint
+    violations when a project is deleted during sync operations.
+    """
+    # Create entity with non-existent project_id
+    entity = Entity(
+        title="Test Entity",
+        note_type="note",
+        file_path="test.md",
+        permalink="test",
+        project_id=99999,  # This project doesn't exist
+        content_type="text/markdown",
+        created_at=datetime.now(timezone.utc),
+        updated_at=datetime.now(timezone.utc),
+    )
+
+    # Should raise SyncFatalError with clear message about missing project
+    with pytest.raises(SyncFatalError) as exc_info:
+        await entity_repository.upsert_entity(entity)
+
+    error_msg = str(exc_info.value)
+    assert "project_id=99999 does not exist" in error_msg
+    assert "project may have been deleted" in error_msg.lower()
+    assert "sync will be terminated" in error_msg.lower()

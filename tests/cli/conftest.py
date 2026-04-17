@@ -1,3 +1,5 @@
+import os
+from pathlib import Path
 from typing import AsyncGenerator
 
 import pytest
@@ -9,14 +11,50 @@ from basic_memory.api.app import app as fastapi_app
 from basic_memory.deps import get_project_config, get_engine_factory, get_app_config
 
 
-@pytest_asyncio.fixture(autouse=True)
-async def app(app_config, project_config, engine_factory, test_config, aiolib) -> FastAPI:
+@pytest.fixture(autouse=True)
+def isolated_home(tmp_path, monkeypatch) -> Path:
+    """Isolate tests from user's HOME directory.
+
+    This prevents tests from reading/writing to ~/.basic-memory/.bmignore
+    or other user-specific configuration.
+
+    Sets BASIC_MEMORY_HOME to tmp_path directly so the default project
+    writes files to tmp_path, which is where tests expect to find them.
+    """
+    # Clear config cache to ensure fresh config for each test
+    from basic_memory import config as config_module
+
+    config_module._CONFIG_CACHE = None
+    config_module._CONFIG_MTIME = None
+    config_module._CONFIG_SIZE = None
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    if os.name == "nt":
+        monkeypatch.setenv("USERPROFILE", str(tmp_path))
+    # Set to tmp_path directly (not tmp_path/basic-memory) so default project
+    # home is tmp_path - tests expect to find imported files there
+    monkeypatch.setenv("BASIC_MEMORY_HOME", str(tmp_path))
+    return tmp_path
+
+
+@pytest_asyncio.fixture
+async def app(
+    app_config, project_config, engine_factory, test_config, aiolib
+) -> AsyncGenerator[FastAPI, None]:
     """Create test FastAPI application."""
     app = fastapi_app
+    previous_overrides = dict(app.dependency_overrides)
     app.dependency_overrides[get_app_config] = lambda: app_config
     app.dependency_overrides[get_project_config] = lambda: project_config
     app.dependency_overrides[get_engine_factory] = lambda: engine_factory
-    return app
+    try:
+        yield app
+    finally:
+        # Trigger: CLI tests share the module-level FastAPI app with API/MCP tests.
+        # Why: leaving per-test dependency overrides installed lets later commands
+        # talk to stale engines that no cleanup fixture owns.
+        # Outcome: keep CLI app wiring isolated to the requesting test.
+        app.dependency_overrides = previous_overrides
 
 
 @pytest_asyncio.fixture
@@ -26,7 +64,7 @@ async def client(app: FastAPI, aiolib) -> AsyncGenerator[AsyncClient, None]:
         yield client
 
 
-@pytest.fixture
-def cli_env(project_config, client, test_config):
+@pytest_asyncio.fixture
+async def cli_env(project_config, client, test_config):
     """Set up CLI environment with correct project session."""
     return {"project_config": project_config, "client": client}

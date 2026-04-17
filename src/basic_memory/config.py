@@ -1,16 +1,21 @@
 """Configuration management for basic-memory."""
 
+import importlib.util
 import json
 import os
+import shutil
 from dataclasses import dataclass
+from datetime import datetime
+from enum import Enum
 from pathlib import Path
-from typing import Any, Dict, Literal, Optional, List, Tuple
+from typing import TYPE_CHECKING, Any, Dict, Literal, Optional, List, Tuple
 
 from loguru import logger
-from pydantic import Field, field_validator
+from pydantic import AliasChoices, BaseModel, Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-import basic_memory
+from basic_memory import __version__
+from basic_memory.telemetry import configure_telemetry
 from basic_memory.utils import setup_logging, generate_permalink
 
 
@@ -23,44 +28,290 @@ WATCH_STATUS_JSON = "watch-status.json"
 Environment = Literal["test", "dev", "user"]
 
 
+class ProjectMode(str, Enum):
+    """Per-project routing mode."""
+
+    LOCAL = "local"
+    CLOUD = "cloud"
+
+
+class DatabaseBackend(str, Enum):
+    """Supported database backends."""
+
+    SQLITE = "sqlite"
+    POSTGRES = "postgres"
+
+
+def _default_semantic_search_enabled() -> bool:
+    """Enable semantic search by default when required local semantic dependencies exist."""
+    required_modules = ("fastembed", "sqlite_vec")
+    return all(
+        importlib.util.find_spec(module_name) is not None for module_name in required_modules
+    )
+
+
+def resolve_data_dir() -> Path:
+    """Resolve the Basic Memory data directory.
+
+    Single source of truth for the per-user state directory. Honors
+    ``BASIC_MEMORY_CONFIG_DIR`` so each process/worktree can isolate config
+    and database state; otherwise falls back to ``<user home>/.basic-memory``.
+
+    Cross-platform: ``Path.home()`` reads ``$HOME`` on POSIX and
+    ``%USERPROFILE%`` on Windows, so there's no need to check ``$HOME``
+    explicitly here.
+    """
+    if config_dir := os.getenv("BASIC_MEMORY_CONFIG_DIR"):
+        return Path(config_dir)
+    return Path.home() / DATA_DIR_NAME
+
+
+def default_fastembed_cache_dir() -> str:
+    """Return the default cache directory used for FastEmbed model artifacts.
+
+    Resolution order:
+      1. ``FASTEMBED_CACHE_PATH`` env var — honors FastEmbed's own convention
+         so users who already configure it through the environment keep working.
+      2. ``<basic-memory data dir>/fastembed_cache`` — the same stable,
+         user-writable directory Basic Memory already uses for config and
+         the default SQLite database. Honors ``BASIC_MEMORY_CONFIG_DIR``.
+
+    Why not ``tempfile.gettempdir()``?
+      FastEmbed's own default is ``<system tmp>/fastembed_cache``, which is
+      ephemeral in many sandboxed MCP runtimes (e.g. Codex CLI wipes /tmp
+      between invocations). The model then disappears and every subsequent
+      ONNX load raises ``NO_SUCHFILE``. Persisting the cache under the
+      per-user data directory works identically on macOS, Linux, and Windows.
+    """
+    if env_override := os.getenv("FASTEMBED_CACHE_PATH"):
+        return env_override
+    return str(resolve_data_dir() / "fastembed_cache")
+
+
 @dataclass
 class ProjectConfig:
     """Configuration for a specific basic-memory project."""
 
     name: str
     home: Path
+    mode: ProjectMode = ProjectMode.LOCAL
 
     @property
     def project(self):
-        return self.name
+        return self.name  # pragma: no cover
 
     @property
     def project_url(self) -> str:  # pragma: no cover
         return f"/{generate_permalink(self.name)}"
 
 
+class CloudProjectConfig(BaseModel):
+    """Sync configuration for a cloud project.
+
+    This tracks the local working directory and sync state for a project
+    that is synced with Basic Memory Cloud.
+
+    DEPRECATED: Kept for backward-compatible migration only. New code should
+    use ProjectEntry fields (cloud_sync_path, bisync_initialized, last_sync).
+    """
+
+    local_path: str = Field(description="Local working directory path for this cloud project")
+    last_sync: Optional[datetime] = Field(
+        default=None, description="Timestamp of last successful sync operation"
+    )
+    bisync_initialized: bool = Field(
+        default=False, description="Whether rclone bisync baseline has been established"
+    )
+
+
+class ProjectEntry(BaseModel):
+    """Unified project configuration entry.
+
+    Replaces the old triple of projects (Dict[str, str]), project_modes
+    (Dict[str, ProjectMode]), and cloud_projects (Dict[str, CloudProjectConfig])
+    with a single structure per project.
+    """
+
+    path: str = Field(description="Local filesystem path for the project")
+    mode: ProjectMode = Field(
+        default=ProjectMode.LOCAL,
+        description="Routing mode: local (in-process ASGI) or cloud (remote API)",
+    )
+    workspace_id: Optional[str] = Field(
+        default=None,
+        description="Cloud workspace tenant_id. Set by 'bm project set-cloud --workspace'.",
+    )
+    # Cloud sync state (replaces CloudProjectConfig)
+    local_sync_path: Optional[str] = Field(
+        default=None,
+        description="Local working directory for bisync",
+        validation_alias=AliasChoices("local_sync_path", "cloud_sync_path"),
+    )
+    bisync_initialized: bool = Field(
+        default=False,
+        description="Whether rclone bisync baseline has been established",
+    )
+    last_sync: Optional[datetime] = Field(
+        default=None,
+        description="Timestamp of last successful sync operation",
+    )
+
+
 class BasicMemoryConfig(BaseSettings):
     """Pydantic model for Basic Memory global configuration."""
 
+    if TYPE_CHECKING:
+        # Pydantic accepts raw constructor data and validates/coerces it at runtime.
+        # Model attributes remain strongly typed after initialization.
+        def __init__(self, **data: Any) -> None: ...
+
     env: Environment = Field(default="dev", description="Environment name")
 
-    projects: Dict[str, str] = Field(
+    projects: Dict[str, ProjectEntry] = Field(
         default_factory=lambda: {
-            "main": Path(os.getenv("BASIC_MEMORY_HOME", Path.home() / "basic-memory")).as_posix()
-        },
-        description="Mapping of project names to their filesystem paths",
+            "main": ProjectEntry(
+                path=str(Path(os.getenv("BASIC_MEMORY_HOME", Path.home() / "basic-memory")))
+            )
+        }
+        if os.getenv("BASIC_MEMORY_HOME")
+        else {},
+        description="Mapping of project names to their ProjectEntry configuration",
     )
-    default_project: str = Field(
-        default="main",
-        description="Name of the default project to use",
-    )
-    default_project_mode: bool = Field(
-        default=False,
-        description="When True, MCP tools automatically use default_project when no project parameter is specified. Enables simplified UX for single-project workflows.",
+    default_project: Optional[str] = Field(
+        default=None,
+        description="Name of the default project to use. When set, acts as fallback when no project parameter is specified. Set to null to disable automatic project resolution.",
     )
 
     # overridden by ~/.basic-memory/config.json
     log_level: str = "INFO"
+
+    # Optional Logfire telemetry (disabled by default)
+    logfire_enabled: bool = Field(
+        default=False,
+        description="Enable Logfire instrumentation for local development or managed deployments.",
+    )
+    logfire_send_to_logfire: bool = Field(
+        default=False,
+        description="When true, allow Logfire to export telemetry to the configured backend.",
+    )
+    logfire_service_name: str = Field(
+        default="basic-memory",
+        description="Base service name used when constructing entrypoint-specific Logfire service names.",
+    )
+    logfire_environment: str | None = Field(
+        default=None,
+        description="Optional override for Logfire environment. Defaults to env when unset.",
+    )
+
+    # Database configuration
+    database_backend: DatabaseBackend = Field(
+        default=DatabaseBackend.SQLITE,
+        description="Database backend to use (sqlite or postgres)",
+    )
+
+    database_url: Optional[str] = Field(
+        default=None,
+        description="Database connection URL. For Postgres, use postgresql+asyncpg://user:pass@host:port/db. If not set, SQLite will use default path.",
+    )
+
+    # Semantic search configuration
+    semantic_search_enabled: bool = Field(
+        default_factory=_default_semantic_search_enabled,
+        description="Enable semantic search (vector/hybrid retrieval). Works on both SQLite and Postgres backends. Requires semantic dependencies (included by default).",
+    )
+    semantic_embedding_provider: str = Field(
+        default="fastembed",
+        description="Embedding provider for local semantic indexing/search.",
+    )
+    semantic_embedding_model: str = Field(
+        default="bge-small-en-v1.5",
+        description="Embedding model identifier used by the local provider.",
+    )
+    semantic_embedding_dimensions: int | None = Field(
+        default=None,
+        description="Embedding vector dimensions. Auto-detected from provider if not set (384 for FastEmbed, 1536 for OpenAI).",
+    )
+    # Trigger: full local rebuilds spend most of their time waiting behind shared
+    # embed flushes, not constructing vectors themselves.
+    # Why: smaller FastEmbed batches cut queue wait far more than they increase
+    # write overhead on real-world projects, which makes full reindex materially faster.
+    # Outcome: default to the smaller local/cloud-safe batch size we benchmarked as
+    # the current best end-to-end setting in the shared vector sync pipeline.
+    semantic_embedding_batch_size: int = Field(
+        default=2,
+        description="Batch size for embedding generation.",
+        gt=0,
+    )
+    semantic_embedding_request_concurrency: int = Field(
+        default=4,
+        description="Maximum number of concurrent provider requests for batched embedding generation when the active provider supports request-level concurrency.",
+        gt=0,
+    )
+    semantic_embedding_sync_batch_size: int = Field(
+        default=2,
+        description="Batch size for vector sync orchestration flushes.",
+        gt=0,
+    )
+    semantic_postgres_prepare_concurrency: int = Field(
+        default=4,
+        description="Number of Postgres entity prepare tasks to run concurrently during vector sync. Postgres only; keep this low to avoid overdriving the database connection pool.",
+        gt=0,
+        le=16,
+    )
+    semantic_embedding_cache_dir: str | None = Field(
+        default=None,
+        description=(
+            "Optional override for the FastEmbed model cache directory. "
+            "When unset, Basic Memory resolves this at runtime to "
+            "<basic-memory data dir>/fastembed_cache (or FASTEMBED_CACHE_PATH "
+            "when that env var is set) so the model persists across runs "
+            "without hardcoding a path into config.json."
+        ),
+    )
+    semantic_embedding_threads: int | None = Field(
+        default=None,
+        description="Optional FastEmbed runtime thread count override.",
+        gt=0,
+    )
+    semantic_embedding_parallel: int | None = Field(
+        default=None,
+        description="Optional FastEmbed embed() parallelism override.",
+        gt=0,
+    )
+    semantic_vector_k: int = Field(
+        default=100,
+        description="Vector candidate count for vector and hybrid retrieval.",
+        gt=0,
+    )
+    semantic_min_similarity: float = Field(
+        default=0.55,
+        description="Minimum similarity score for vector search results. Results below this threshold are filtered out. 0.0 disables filtering.",
+        ge=0.0,
+        le=1.0,
+    )
+    default_search_type: Literal["text", "vector", "hybrid"] | None = Field(
+        default=None,
+        description="Default search type for search_notes when not specified per-query. "
+        "Valid values: text, vector, hybrid. "
+        "When unset, defaults to 'hybrid' if semantic search is enabled, otherwise 'text'.",
+    )
+
+    # Database connection pool configuration (Postgres only)
+    db_pool_size: int = Field(
+        default=20,
+        description="Number of connections to keep in the pool (Postgres only)",
+        gt=0,
+    )
+    db_pool_overflow: int = Field(
+        default=40,
+        description="Max additional connections beyond pool_size under load (Postgres only)",
+        gt=0,
+    )
+    db_pool_recycle: int = Field(
+        default=180,
+        description="Recycle connections after N seconds to prevent stale connections. Default 180s works well with Neon's ~5 minute scale-to-zero (Postgres only)",
+        gt=0,
+    )
 
     # Watch service configuration
     sync_delay: int = Field(
@@ -68,7 +319,9 @@ class BasicMemoryConfig(BaseSettings):
     )
 
     watch_project_reload_interval: int = Field(
-        default=30, description="Seconds between reloading project list in watch service", gt=0
+        default=300,
+        description="Seconds between reloading project list in watch service. Higher values reduce CPU usage by minimizing watcher restarts. Default 300s (5 min) balances efficiency with responsiveness to new projects.",
+        gt=0,
     )
 
     # update permalinks on move
@@ -84,7 +337,38 @@ class BasicMemoryConfig(BaseSettings):
 
     sync_thread_pool_size: int = Field(
         default=4,
-        description="Size of thread pool for file I/O operations in sync service",
+        description="Size of thread pool for file I/O operations in sync service. Default of 4 is optimized for cloud deployments with 1-2GB RAM.",
+        gt=0,
+    )
+
+    sync_max_concurrent_files: int = Field(
+        default=10,
+        description="Maximum number of files to process concurrently during sync. Limits memory usage on large projects (2000+ files). Lower values reduce memory consumption.",
+        gt=0,
+    )
+    index_batch_size: int = Field(
+        default=32,
+        description="Maximum number of changed files to load into one indexing batch.",
+        gt=0,
+    )
+    index_batch_max_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        description="Maximum total bytes to load into one indexing batch. Large files still run as single-file batches.",
+        gt=0,
+    )
+    index_parse_max_concurrent: int = Field(
+        default=8,
+        description="Maximum number of markdown parse tasks to run concurrently inside one indexing batch.",
+        gt=0,
+    )
+    index_entity_max_concurrent: int = Field(
+        default=4,
+        description="Maximum number of entity create/update tasks to run concurrently inside one indexing batch.",
+        gt=0,
+    )
+    index_metadata_update_max_concurrent: int = Field(
+        default=4,
+        description="Maximum number of metadata/search refresh tasks to run concurrently inside one indexing batch.",
         gt=0,
     )
 
@@ -93,20 +377,67 @@ class BasicMemoryConfig(BaseSettings):
         description="Format for generated filenames. False preserves spaces and special chars, True converts them to hyphens for consistency with permalinks",
     )
 
+    disable_permalinks: bool = Field(
+        default=False,
+        description="Disable automatic permalink generation in frontmatter. When enabled, new notes won't have permalinks added and sync won't update permalinks. Existing permalinks will still work for reading.",
+    )
+
+    write_note_overwrite_default: bool = Field(
+        default=False,
+        description=(
+            "Default value for write_note's overwrite parameter. "
+            "When False (default), write_note errors if note already exists. "
+            "Set to True to restore pre-v0.20 upsert behavior. "
+            "Env: BASIC_MEMORY_WRITE_NOTE_OVERWRITE_DEFAULT"
+        ),
+    )
+
+    ensure_frontmatter_on_sync: bool = Field(
+        default=True,
+        description="Ensure markdown files have frontmatter during sync by adding derived title/type/permalink when missing. When combined with disable_permalinks=True, this setting takes precedence for missing-frontmatter files and still writes permalinks.",
+    )
+
+    permalinks_include_project: bool = Field(
+        default=True,
+        description="When True, generated permalinks are prefixed with the project slug (e.g., 'specs/search'). Existing permalinks remain unchanged unless explicitly updated.",
+    )
+
     skip_initialization_sync: bool = Field(
         default=False,
         description="Skip expensive initialization synchronization. Useful for cloud/stateless deployments where project reconciliation is not needed.",
     )
 
-    # API connection configuration
-    api_url: Optional[str] = Field(
+    # File formatting configuration
+    format_on_save: bool = Field(
+        default=False,
+        description="Automatically format files after saving using configured formatter. Disabled by default.",
+    )
+
+    formatter_command: Optional[str] = Field(
         default=None,
-        description="URL of remote Basic Memory API. If set, MCP will connect to this API instead of using local ASGI transport.",
+        description="External formatter command. Use {file} as placeholder for file path. If not set, uses built-in mdformat (Python, no Node.js required). Set to 'npx prettier --write {file}' for Prettier.",
+    )
+
+    formatters: Dict[str, str] = Field(
+        default_factory=dict,
+        description="Per-extension formatters. Keys are extensions (without dot), values are commands. Example: {'md': 'prettier --write {file}', 'json': 'prettier --write {file}'}",
+    )
+
+    formatter_timeout: float = Field(
+        default=5.0,
+        description="Maximum seconds to wait for formatter to complete",
+        gt=0,
+    )
+
+    # Project path constraints
+    project_root: Optional[str] = Field(
+        default=None,
+        description="If set, all projects must be created underneath this directory. Paths will be sanitized and constrained to this root. If not set, projects can be created anywhere (default behavior).",
     )
 
     # Cloud configuration
     cloud_client_id: str = Field(
-        default="client_01K4DGBWAZWP83N3H8VVEMRX6W",
+        default="client_01K6KWQPW6J1M8VV7R3TZP5A6M",
         description="OAuth client ID for Basic Memory Cloud",
     )
 
@@ -116,15 +447,210 @@ class BasicMemoryConfig(BaseSettings):
     )
 
     cloud_host: str = Field(
-        default="https://cloud.basicmemory.com",
-        description="Basic Memory Cloud proxy host URL",
+        default_factory=lambda: os.getenv(
+            "BASIC_MEMORY_CLOUD_HOST", "https://cloud.basicmemory.com"
+        ),
+        description="Basic Memory Cloud host URL",
     )
+
+    cloud_promo_opt_out: bool = Field(
+        default=False,
+        description="Disable CLI cloud promo messages when true.",
+    )
+
+    cloud_promo_first_run_shown: bool = Field(
+        default=False,
+        description="Tracks whether the first-run cloud promo message has been shown.",
+    )
+
+    cloud_promo_last_version_shown: Optional[str] = Field(
+        default=None,
+        description="Most recent cloud promo version shown in CLI.",
+    )
+
+    auto_update: bool = Field(
+        default=True,
+        description="Enable automatic CLI update checks and installs when supported.",
+    )
+
+    update_check_interval: int = Field(
+        default=86400,
+        description="Seconds between automatic update checks.",
+        gt=0,
+    )
+
+    auto_update_last_checked_at: Optional[datetime] = Field(
+        default=None,
+        description="Timestamp of the last attempted automatic update check.",
+    )
+
+    cloud_api_key: Optional[str] = Field(
+        default=None,
+        description="API key for cloud access (bmc_ prefixed). Account-level, not per-project.",
+    )
+
+    default_workspace: Optional[str] = Field(
+        default=None,
+        description="Default cloud workspace tenant_id. Set by 'bm cloud workspace set-default'.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def migrate_legacy_projects(cls, data: Any) -> Any:
+        """Migrate old-format config (Dict[str, str]) to new ProjectEntry format.
+
+        Old format stored projects as three separate dicts:
+          projects:      {"name": "/path"}
+          project_modes: {"name": "cloud"}
+          cloud_projects: {"name": {"local_path": "...", ...}}
+
+        New format unifies them into:
+          projects: {"name": {"path": "/path", "mode": "cloud", ...}}
+
+        Also removes stale keys (default_project_mode, permalinks_include_project)
+        that are no longer part of the config model.
+        """
+        if not isinstance(data, dict):
+            return data
+
+        # --- Remove stale keys from old config versions ---
+        data.pop("default_project_mode", None)
+        data.pop("cloud_mode", None)
+
+        projects = data.get("projects", {})
+        if not projects:
+            return data
+
+        # Check if already in new format — peek at first value
+        first_value = next(iter(projects.values()), None)
+        if isinstance(first_value, str):
+            # Old format: {"name": "/path"} → convert
+            project_modes = data.pop("project_modes", {})
+            cloud_projects = data.pop("cloud_projects", {})
+            new_projects: Dict[str, Any] = {}
+            for name, path in projects.items():
+                entry: Dict[str, Any] = {"path": path}
+                if name in project_modes:
+                    entry["mode"] = project_modes[name]
+                if name in cloud_projects:
+                    cp = cloud_projects[name]
+                    if isinstance(cp, dict):
+                        entry["local_sync_path"] = cp.get("local_path")
+                        entry["bisync_initialized"] = cp.get("bisync_initialized", False)
+                        entry["last_sync"] = cp.get("last_sync")
+                    else:
+                        # Already a CloudProjectConfig-like object
+                        entry["local_sync_path"] = getattr(cp, "local_path", None)
+                        entry["bisync_initialized"] = getattr(cp, "bisync_initialized", False)
+                        entry["last_sync"] = getattr(cp, "last_sync", None)
+                new_projects[name] = entry
+
+            # Pick up cloud_projects entries not already in projects
+            # These are cloud-only projects — path should be the local working
+            # directory (if one exists), local_path goes into local_sync_path for bisync
+            for name, cp in cloud_projects.items():
+                if name not in new_projects:
+                    if isinstance(cp, dict):
+                        local_path = cp.get("local_path", "")
+                        new_projects[name] = {
+                            "path": local_path or "",
+                            "mode": project_modes.get(name, "cloud"),
+                            "local_sync_path": local_path,
+                            "bisync_initialized": cp.get("bisync_initialized", False),
+                            "last_sync": cp.get("last_sync"),
+                        }
+
+            data["projects"] = new_projects
+        else:
+            # New format or dict-based — just clean up stale keys
+            data.pop("project_modes", None)
+            data.pop("cloud_projects", None)
+
+        # --- Promote local_sync_path into path for cloud projects with slug paths ---
+        # Trigger: project entry has local_sync_path set but path is a cloud slug (not absolute)
+        # Why: path must always be the local filesystem path; the cloud remote is derivable
+        # Outcome: path becomes the local directory, local_sync_path kept for backwards compat
+        projects = data.get("projects", {})
+        for name, entry in projects.items():
+            if isinstance(entry, dict):
+                lsp = entry.get("local_sync_path")
+                path = entry.get("path", "")
+                if lsp and not os.path.isabs(path):
+                    entry["path"] = lsp
+
+        return data
+
+    @property
+    def is_test_env(self) -> bool:
+        """Check if running in a test environment.
+
+        Returns True if any of:
+        - env field is set to "test"
+        - BASIC_MEMORY_ENV environment variable is "test"
+        - PYTEST_CURRENT_TEST environment variable is set (pytest is running)
+
+        Used to disable features like file watchers during tests.
+        """
+        return (
+            self.env == "test"
+            or os.getenv("BASIC_MEMORY_ENV", "").lower() == "test"
+            or os.getenv("PYTEST_CURRENT_TEST") is not None
+        )
+
+    def get_project_mode(self, project_name: str) -> ProjectMode:
+        """Get the routing mode for a project.
+
+        Returns the per-project mode if set.
+        Unknown projects (not in local config) default to CLOUD —
+        local projects are always registered in config.
+        """
+        entry = self.projects.get(project_name)
+        return entry.mode if entry else ProjectMode.CLOUD
+
+    def set_project_mode(self, project_name: str, mode: ProjectMode) -> None:
+        """Set the routing mode for a project.
+
+        Creates a minimal ProjectEntry if the project doesn't already exist,
+        preserving backward compatibility with code that sets mode before
+        adding a full project entry.
+        """
+        if project_name in self.projects:
+            self.projects[project_name].mode = mode
+        else:
+            self.projects[project_name] = ProjectEntry(path="", mode=mode)
+
+    @classmethod
+    def for_cloud_tenant(
+        cls,
+        database_url: str,
+        projects: Optional[Dict[str, "ProjectEntry"]] = None,
+    ) -> "BasicMemoryConfig":
+        """Create config for cloud tenant - no config.json, database is source of truth.
+
+        This factory method creates a BasicMemoryConfig suitable for cloud deployments
+        where:
+        - Database is Postgres (Neon), not SQLite
+        - Projects are discovered from the database, not config file
+        - Path validation is skipped (no local filesystem in cloud)
+        - Initialization sync is skipped (stateless deployment)
+
+        Args:
+            database_url: Postgres connection URL for tenant database
+            projects: Optional project mapping (usually empty, discovered from DB)
+
+        Returns:
+            BasicMemoryConfig configured for cloud mode
+        """
+        return cls(  # pragma: no cover
+            database_backend=DatabaseBackend.POSTGRES,
+            database_url=database_url,
+            projects=projects or {},
+            skip_initialization_sync=True,
+        )
 
     model_config = SettingsConfigDict(
         env_prefix="BASIC_MEMORY_",
         extra="ignore",
-        env_file=".env",
-        env_file_encoding="utf-8",
     )
 
     def get_project_path(self, project_name: Optional[str] = None) -> Path:  # pragma: no cover
@@ -134,19 +660,34 @@ class BasicMemoryConfig(BaseSettings):
         if name not in self.projects:
             raise ValueError(f"Project '{name}' not found in configuration")
 
-        return Path(self.projects[name])
+        return Path(self.projects[name].path)
 
     def model_post_init(self, __context: Any) -> None:
         """Ensure configuration is valid after initialization."""
-        # Ensure main project exists
-        if "main" not in self.projects:  # pragma: no cover
-            self.projects["main"] = (
-                Path(os.getenv("BASIC_MEMORY_HOME", Path.home() / "basic-memory"))
-            ).as_posix()
+        # Skip project initialization in cloud mode - projects are discovered from DB
+        if self.database_backend == DatabaseBackend.POSTGRES:  # pragma: no cover
+            return  # pragma: no cover
 
-        # Ensure default project is valid
-        if self.default_project not in self.projects:  # pragma: no cover
-            self.default_project = "main"
+        # Trigger: no projects configured (fresh install or empty config)
+        # Why: every config needs at least one project to be functional
+        # Outcome: creates "main" project using BASIC_MEMORY_HOME or ~/basic-memory
+        if not self.projects:
+            self.projects["main"] = ProjectEntry(
+                path=str(Path(os.getenv("BASIC_MEMORY_HOME", Path.home() / "basic-memory")))
+            )
+
+        # Trigger: default_project was not explicitly provided in the input data
+        #          (config file omitted the key, or BasicMemoryConfig() called with no args)
+        # Why: callers like get_project_config() expect a valid project name;
+        #      but explicit None (discovery mode) must be preserved
+        # Outcome: sets default_project to the first available project
+        if "default_project" not in self.model_fields_set:
+            self.default_project = next(iter(self.projects.keys()))
+        # Trigger: default_project was explicitly set but references a non-existent project
+        # Why: project may have been removed or renamed since config was saved
+        # Outcome: corrects to the first available project
+        elif self.default_project is not None and self.default_project not in self.projects:
+            self.default_project = next(iter(self.projects.keys()))
 
     @property
     def app_database_path(self) -> Path:
@@ -154,8 +695,11 @@ class BasicMemoryConfig(BaseSettings):
 
         This is the single database that will store all knowledge data
         across all projects.
+
+        Uses BASIC_MEMORY_CONFIG_DIR when set so each process/worktree can
+        isolate both config and database state.
         """
-        database_path = Path.home() / DATA_DIR_NAME / APP_DATABASE_NAME
+        database_path = self.data_dir_path / APP_DATABASE_NAME
         if not database_path.exists():  # pragma: no cover
             database_path.parent.mkdir(parents=True, exist_ok=True)
             database_path.touch()
@@ -177,25 +721,49 @@ class BasicMemoryConfig(BaseSettings):
     @property
     def project_list(self) -> List[ProjectConfig]:  # pragma: no cover
         """Get all configured projects as ProjectConfig objects."""
-        return [ProjectConfig(name=name, home=Path(path)) for name, path in self.projects.items()]
+        return [
+            ProjectConfig(name=name, home=Path(entry.path), mode=entry.mode)
+            for name, entry in self.projects.items()
+        ]
 
-    @field_validator("projects")
-    @classmethod
-    def ensure_project_paths_exists(cls, v: Dict[str, str]) -> Dict[str, str]:  # pragma: no cover
-        """Ensure project path exists."""
-        for name, path_value in v.items():
-            path = Path(path_value)
-            if not Path(path).exists():
+    @model_validator(mode="after")
+    def ensure_project_paths_exists(self) -> "BasicMemoryConfig":  # pragma: no cover
+        """Ensure project paths exist.
+
+        Skips path creation when using Postgres backend (cloud mode) since
+        cloud tenants don't use local filesystem paths.
+        """
+        # Skip path creation for cloud mode - no local filesystem
+        if self.database_backend == DatabaseBackend.POSTGRES:
+            return self
+
+        for name, entry in self.projects.items():
+            path = Path(entry.path)
+            # Skip cloud-only projects whose path is a slug, not a local directory
+            if not path.is_absolute():
+                continue
+            if not path.exists():
                 try:
                     path.mkdir(parents=True)
                 except Exception as e:
                     logger.error(f"Failed to create project path: {e}")
                     raise e
-        return v
+        return self
 
     @property
-    def data_dir_path(self):
-        return Path.home() / DATA_DIR_NAME
+    def data_dir_path(self) -> Path:
+        """Get app state directory for config and default SQLite database."""
+        return resolve_data_dir()
+
+
+# Module-level cache for configuration
+_CONFIG_CACHE: Optional[BasicMemoryConfig] = None
+# Track config file mtime+size so cross-process changes (e.g. `bm project set-cloud`
+# in a separate terminal) invalidate the cache in long-lived processes like the
+# MCP stdio server. Using both mtime and size guards against coarse-granularity
+# filesystems where two writes within the same second share the same mtime.
+_CONFIG_MTIME: Optional[float] = None
+_CONFIG_SIZE: Optional[int] = None
 
 
 class ConfigManager:
@@ -203,11 +771,7 @@ class ConfigManager:
 
     def __init__(self) -> None:
         """Initialize the configuration manager."""
-        home = os.getenv("HOME", Path.home())
-        if isinstance(home, str):
-            home = Path(home)
-
-        self.config_dir = home / DATA_DIR_NAME
+        self.config_dir = resolve_data_dir()
         self.config_file = self.config_dir / CONFIG_FILE_NAME
 
         # Ensure config directory exists
@@ -219,31 +783,154 @@ class ConfigManager:
         return self.load_config()
 
     def load_config(self) -> BasicMemoryConfig:
-        """Load configuration from file or create default."""
+        """Load configuration from file or create default.
+
+        Environment variables take precedence over file config values,
+        following Pydantic Settings best practices.
+
+        Uses module-level cache with file mtime validation so that
+        cross-process config changes (e.g. `bm project set-cloud` in a
+        separate terminal) are picked up by long-lived processes like
+        the MCP stdio server.
+        """
+        global _CONFIG_CACHE, _CONFIG_MTIME, _CONFIG_SIZE
+
+        # Trigger: cached config exists but the on-disk file may have been
+        # modified by another process (CLI command in a different terminal).
+        # Why: the MCP server is long-lived; without this check it would
+        # serve stale project routing forever.
+        # Outcome: cheap os.stat() per access; re-read only when mtime or size differs.
+        if _CONFIG_CACHE is not None:
+            try:
+                st = self.config_file.stat()
+                current_mtime = st.st_mtime
+                current_size = st.st_size
+            except OSError:
+                current_mtime = None
+                current_size = None
+
+            if (
+                current_mtime is not None
+                and current_mtime == _CONFIG_MTIME
+                and current_size == _CONFIG_SIZE
+            ):
+                return _CONFIG_CACHE
+
+            # mtime/size changed or file gone — invalidate and fall through to re-read
+            _CONFIG_CACHE = None
+            _CONFIG_MTIME = None
+            _CONFIG_SIZE = None
 
         if self.config_file.exists():
             try:
-                data = json.loads(self.config_file.read_text(encoding="utf-8"))
-                return BasicMemoryConfig(**data)
+                file_data = json.loads(self.config_file.read_text(encoding="utf-8"))
+
+                # Detect legacy format before model validators strip stale keys
+                _STALE_KEYS = {
+                    "default_project_mode",
+                    "project_modes",
+                    "cloud_projects",
+                    "cloud_mode",
+                }
+                needs_resave = bool(_STALE_KEYS & file_data.keys())
+
+                # Check if projects dict uses old string-value format
+                projects_raw = file_data.get("projects", {})
+                if projects_raw:
+                    first_val = next(iter(projects_raw.values()), None)
+                    if isinstance(first_val, str):
+                        needs_resave = True
+
+                # Check if any project has local_sync_path set but path is a cloud slug
+                # (will be migrated by migrate_legacy_projects validator)
+                if not needs_resave:
+                    for entry_data in projects_raw.values():
+                        if isinstance(entry_data, dict):
+                            lsp = entry_data.get("local_sync_path")
+                            p = entry_data.get("path", "")
+                            if lsp and not os.path.isabs(p):
+                                needs_resave = True
+                                break
+
+                # First, create config from environment variables (Pydantic will read them)
+                # Then overlay with file data for fields that aren't set via env vars
+                # This ensures env vars take precedence
+
+                # Get env-based config fields that are actually set
+                env_config = BasicMemoryConfig()
+                env_dict = env_config.model_dump()
+
+                # Merge: file data as base, but only use it for fields not set by env
+                # We detect env-set fields by comparing to default values
+                merged_data = file_data.copy()
+
+                # For fields that have env var overrides, use those instead of file values
+                # The env_prefix is "BASIC_MEMORY_" so we check those
+                for field_name in BasicMemoryConfig.model_fields.keys():
+                    env_var_name = f"BASIC_MEMORY_{field_name.upper()}"
+                    if env_var_name in os.environ:
+                        # Environment variable is set, use it
+                        merged_data[field_name] = env_dict[field_name]
+
+                _CONFIG_CACHE = BasicMemoryConfig(**merged_data)
+
+                # Record mtime+size so subsequent calls detect cross-process changes
+                try:
+                    st = self.config_file.stat()
+                    _CONFIG_MTIME = st.st_mtime
+                    _CONFIG_SIZE = st.st_size
+                except OSError:
+                    _CONFIG_MTIME = None
+                    _CONFIG_SIZE = None
+
+                # Re-save to normalize legacy config into current format
+                if needs_resave:
+                    # Create backup before overwriting so users can revert if needed
+                    backup_path = self.config_file.with_suffix(".json.bak")
+                    shutil.copy2(self.config_file, backup_path)
+                    logger.info(f"Migrating config to current format (backup: {backup_path})")
+                    save_basic_memory_config(self.config_file, _CONFIG_CACHE)
+
+                return _CONFIG_CACHE
+            except json.JSONDecodeError as e:  # pragma: no cover
+                logger.error(f"Invalid JSON in config file {self.config_file}: {e}")
+                raise SystemExit(
+                    f"Error: config file is not valid JSON: {self.config_file}\n"
+                    f"  {e}\n"
+                    f"Fix or delete the file and re-run."
+                )
             except Exception as e:  # pragma: no cover
-                logger.exception(f"Failed to load config: {e}")
-                raise e
+                logger.error(f"Failed to load config from {self.config_file}: {e}")
+                raise SystemExit(
+                    f"Error: failed to load config from {self.config_file}\n"
+                    f"  {e}\n"
+                    f"Fix or delete the file and re-run."
+                )
         else:
             config = BasicMemoryConfig()
             self.save_config(config)
             return config
 
     def save_config(self, config: BasicMemoryConfig) -> None:
-        """Save configuration to file."""
+        """Save configuration to file and invalidate cache."""
+        global _CONFIG_CACHE, _CONFIG_MTIME, _CONFIG_SIZE
         save_basic_memory_config(self.config_file, config)
+        # Invalidate cache so next load_config() reads fresh data
+        _CONFIG_CACHE = None
+        _CONFIG_MTIME = None
+        _CONFIG_SIZE = None
 
     @property
     def projects(self) -> Dict[str, str]:
-        """Get all configured projects."""
-        return self.config.projects.copy()
+        """Get all configured projects as name -> path mapping.
+
+        Returns the legacy Dict[str, str] format for backward compatibility
+        with code that expects project name -> filesystem path.
+        """
+        return {name: entry.path for name, entry in self.config.projects.items()}
 
     @property
-    def default_project(self) -> str:
+    def default_project(self) -> Optional[str]:
         """Get the default project name."""
         return self.config.default_project
 
@@ -253,13 +940,10 @@ class ConfigManager:
         if project_name:  # pragma: no cover
             raise ValueError(f"Project '{name}' already exists")
 
-        # Ensure the path exists
-        project_path = Path(path)
-        project_path.mkdir(parents=True, exist_ok=True)  # pragma: no cover
-
         # Load config, modify it, and save it
+        project_path = Path(path)
         config = self.load_config()
-        config.projects[name] = project_path.as_posix()
+        config.projects[name] = ProjectEntry(path=str(project_path))
         self.save_config(config)
         return ProjectConfig(name=name, home=project_path)
 
@@ -275,7 +959,8 @@ class ConfigManager:
         if project_name == config.default_project:  # pragma: no cover
             raise ValueError(f"Cannot remove the default project '{name}'")
 
-        del config.projects[name]
+        # Use the found project_name (which may differ from input name due to permalink matching)
+        del config.projects[project_name]
         self.save_config(config)
 
     def set_default_project(self, name: str) -> None:
@@ -290,12 +975,15 @@ class ConfigManager:
         self.save_config(config)
 
     def get_project(self, name: str) -> Tuple[str, str] | Tuple[None, None]:
-        """Look up a project from the configuration by name or permalink"""
+        """Look up a project from the configuration by name or permalink.
+
+        Returns (project_name, path_string) for backward compatibility.
+        """
         project_permalink = generate_permalink(name)
         app_config = self.config
-        for project_name, path in app_config.projects.items():
+        for project_name, entry in app_config.projects.items():
             if project_permalink == generate_permalink(project_name):
-                return project_name, path
+                return project_name, entry.path
         return None, None
 
 
@@ -330,85 +1018,87 @@ def get_project_config(project_name: Optional[str] = None) -> ProjectConfig:
 
     project_permalink = generate_permalink(actual_project_name)
 
-    for name, path in app_config.projects.items():
+    for name, entry in app_config.projects.items():
         if project_permalink == generate_permalink(name):
-            return ProjectConfig(name=name, home=Path(path))
+            return ProjectConfig(name=name, home=Path(entry.path))
 
     # otherwise raise error
     raise ValueError(f"Project '{actual_project_name}' not found")  # pragma: no cover
 
 
+def has_cloud_credentials(config: BasicMemoryConfig) -> bool:
+    """Check if cloud credentials are available (API key or OAuth token).
+
+    Shared utility used by both MCP tools and CLI commands to determine
+    whether cloud project discovery is possible.
+    """
+    if config.cloud_api_key:
+        return True
+    from basic_memory.cli.auth import CLIAuth
+
+    auth = CLIAuth(client_id=config.cloud_client_id, authkit_domain=config.cloud_domain)
+    return auth.load_tokens() is not None
+
+
 def save_basic_memory_config(file_path: Path, config: BasicMemoryConfig) -> None:
     """Save configuration to file."""
     try:
-        file_path.write_text(json.dumps(config.model_dump(), indent=2))
+        # Use model_dump with mode='json' to serialize datetime objects properly
+        config_dict = config.model_dump(mode="json")
+        file_path.write_text(json.dumps(config_dict, indent=2))
     except Exception as e:  # pragma: no cover
         logger.error(f"Failed to save config: {e}")
 
 
-# setup logging to a single log file in user home directory
-user_home = Path.home()
-log_dir = user_home / DATA_DIR_NAME
-log_dir.mkdir(parents=True, exist_ok=True)
+# Logging initialization functions for different entry points
 
 
-# Process info for logging
-def get_process_name():  # pragma: no cover
-    """
-    get the type of process for logging
-    """
-    import sys
-
-    if "sync" in sys.argv:
-        return "sync"
-    elif "mcp" in sys.argv:
-        return "mcp"
-    elif "cli" in sys.argv:
-        return "cli"
-    else:
-        return "api"
-
-
-process_name = get_process_name()
-
-# Global flag to track if logging has been set up
-_LOGGING_SETUP = False
-
-
-# Logging
-
-
-def setup_basic_memory_logging():  # pragma: no cover
-    """Set up logging for basic-memory, ensuring it only happens once."""
-    global _LOGGING_SETUP
-    if _LOGGING_SETUP:
-        # We can't log before logging is set up
-        # print("Skipping duplicate logging setup")
-        return
-
-    # Check for console logging environment variable - accept more truthy values
-    console_logging_env = os.getenv("BASIC_MEMORY_CONSOLE_LOGGING", "false").lower()
-    console_logging = console_logging_env in ("true", "1", "yes", "on")
-
-    # Check for log level environment variable first, fall back to config
-    log_level = os.getenv("BASIC_MEMORY_LOG_LEVEL")
-    if not log_level:
-        config_manager = ConfigManager()
-        log_level = config_manager.config.log_level
-
-    config_manager = ConfigManager()
-    config = get_project_config()
-    setup_logging(
-        env=config_manager.config.env,
-        home_dir=user_home,  # Use user home for logs
-        log_level=log_level,
-        log_file=f"{DATA_DIR_NAME}/basic-memory-{process_name}.log",
-        console=console_logging,
+def _configure_logfire_for_entrypoint(entrypoint: str) -> None:
+    """Configure optional Logfire telemetry for a specific entrypoint."""
+    config = ConfigManager().config
+    service_name = f"{config.logfire_service_name}-{entrypoint}"
+    environment = config.logfire_environment or config.env
+    configure_telemetry(
+        service_name=service_name,
+        environment=environment,
+        service_version=__version__,
+        enable_logfire=config.logfire_enabled,
+        send_to_logfire=config.logfire_send_to_logfire,
     )
 
-    logger.info(f"Basic Memory {basic_memory.__version__} (Project: {config.project})")
-    _LOGGING_SETUP = True
+
+def init_cli_logging() -> None:
+    """Initialize logging for CLI commands - file only.
+
+    CLI commands should not log to stdout to avoid interfering with
+    command output and shell integration.
+    """
+    log_level = os.getenv("BASIC_MEMORY_LOG_LEVEL", "INFO")
+    _configure_logfire_for_entrypoint("cli")
+    setup_logging(log_level=log_level, log_to_file=True)
 
 
-# Set up logging
-setup_basic_memory_logging()
+def init_mcp_logging() -> None:
+    """Initialize logging for MCP server - file only.
+
+    MCP server must not log to stdout as it would corrupt the
+    JSON-RPC protocol communication.
+    """
+    log_level = os.getenv("BASIC_MEMORY_LOG_LEVEL", "INFO")
+    _configure_logfire_for_entrypoint("mcp")
+    setup_logging(log_level=log_level, log_to_file=True)
+
+
+def init_api_logging() -> None:
+    """Initialize logging for API server.
+
+    Cloud mode (BASIC_MEMORY_CLOUD_MODE=1): stdout with structured context
+    Local mode: file only
+    """
+    log_level = os.getenv("BASIC_MEMORY_LOG_LEVEL", "INFO")
+    _configure_logfire_for_entrypoint("api")
+    cloud_mode = os.getenv("BASIC_MEMORY_CLOUD_MODE", "").lower() in ("1", "true")
+    if cloud_mode:
+        setup_logging(log_level=log_level, log_to_stdout=True, structured_context=True)
+    else:
+        setup_logging(log_level=log_level, log_to_file=True)

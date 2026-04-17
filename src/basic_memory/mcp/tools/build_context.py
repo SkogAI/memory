@@ -1,22 +1,113 @@
 """Build context tool for Basic Memory MCP server."""
 
-from typing import Optional
+from typing import Optional, Literal
 
 from loguru import logger
 from fastmcp import Context
 
-from basic_memory.mcp.async_client import client
-from basic_memory.mcp.project_context import get_active_project
+from basic_memory.config import ConfigManager
+from basic_memory import telemetry
+from basic_memory.mcp.project_context import (
+    detect_project_from_url_prefix,
+    get_project_client,
+    resolve_project_and_path,
+)
 from basic_memory.mcp.server import mcp
-from basic_memory.mcp.tools.utils import call_get
 from basic_memory.schemas.base import TimeFrame
 from basic_memory.schemas.memory import (
+    ContextResult,
+    EntitySummary,
     GraphContext,
     MemoryUrl,
-    memory_url_path,
+    ObservationSummary,
+    RelationSummary,
 )
 
-type StringOrInt = str | int
+
+def _format_entity_block(result: ContextResult) -> str:
+    """Format a single context result as a markdown block."""
+    primary = result.primary_result
+    lines = []
+
+    # --- Header ---
+    lines.append(f"## {primary.title}")
+    if primary.permalink:
+        lines.append(f"permalink: {primary.permalink}")
+    # RelationSummary has no content field; Entity/Observation do
+    if not isinstance(primary, RelationSummary) and primary.content:
+        lines.append("")
+        lines.append(primary.content)
+
+    # --- Observations ---
+    if result.observations:
+        lines.append("")
+        lines.append("### Observations")
+        for obs in result.observations:
+            lines.append(f"- [{obs.category}] {obs.content}")
+
+    # --- Relations (from primary's related_results that are RelationSummary) ---
+    relation_items: list[RelationSummary] = [
+        r for r in result.related_results if isinstance(r, RelationSummary)
+    ]
+    if relation_items:
+        lines.append("")
+        lines.append("### Relations")
+        for rel in relation_items:
+            lines.append(f"- {rel.relation_type} [[{rel.to_entity}]]")
+
+    # --- Related entities (non-relation related results) ---
+    related_entities: list[EntitySummary | ObservationSummary] = [
+        r for r in result.related_results if not isinstance(r, RelationSummary)
+    ]
+    if related_entities:
+        lines.append("")
+        lines.append("### Related")
+        for item in related_entities:
+            permalink = item.permalink if item.permalink else ""
+            lines.append(f"- [[{item.title}]] ({permalink})")
+
+    return "\n".join(lines)
+
+
+def _format_context_markdown(graph: GraphContext, project: str) -> str:
+    """Format GraphContext as compact markdown text.
+
+    Produces a human-readable markdown representation that is much smaller
+    than the equivalent JSON, suitable for LLM consumption when structured
+    data isn't needed.
+    """
+    if not graph.results:
+        uri = graph.metadata.uri or ""
+        return f"No results found for '{uri}' in project '{project}'."
+
+    parts = []
+
+    # --- Title from first primary result ---
+    first_title = graph.results[0].primary_result.title
+    if len(graph.results) == 1:
+        parts.append(f"# Context: {first_title}")
+    else:
+        uri = graph.metadata.uri or ""
+        parts.append(f"# Context: {uri}")
+
+    parts.append("")
+
+    # --- Entity blocks separated by --- ---
+    entity_blocks = [_format_entity_block(result) for result in graph.results]
+    parts.append("\n\n---\n\n".join(entity_blocks))
+
+    # --- Footer ---
+    meta = graph.metadata
+    primary_count = meta.primary_count or 0
+    related_count = meta.related_count or 0
+    parts.append("")
+    parts.append("---")
+    parts.append(
+        f"*{primary_count} primary, {related_count} related"
+        f" | depth={meta.depth} | project: {project}*"
+    )
+
+    return "\n".join(parts)
 
 
 @mcp.tool(
@@ -34,18 +125,25 @@ type StringOrInt = str | int
     Timeframes support natural language like:
     - "2 days ago", "last week", "today", "3 months ago"
     - Or standard formats like "7d", "24h"
+
+    Format options:
+    - "json" (default): Structured JSON with internal fields excluded
+    - "text": Compact markdown text for LLM consumption
     """,
+    annotations={"readOnlyHint": True, "openWorldHint": False},
 )
 async def build_context(
     url: MemoryUrl,
     project: Optional[str] = None,
-    depth: Optional[StringOrInt] = 1,
+    workspace: Optional[str] = None,
+    depth: str | int | None = 1,
     timeframe: Optional[TimeFrame] = "7d",
     page: int = 1,
     page_size: int = 10,
     max_related: int = 10,
+    output_format: Literal["json", "text"] = "json",
     context: Context | None = None,
-) -> GraphContext:
+) -> dict | str:
     """Get context needed to continue a discussion within a specific project.
 
     This tool enables natural continuation of discussions by loading relevant context
@@ -53,8 +151,9 @@ async def build_context(
     a rich context graph of related information.
 
     Project Resolution:
-    Server resolves projects in this order: Single Project Mode → project parameter → default project.
-    If project unknown, use list_memory_projects() or recent_activity() first.
+    Server resolves projects using a unified priority chain (same in local and cloud modes):
+    Single Project Mode → project parameter → default project.
+    Uses default project automatically. Specify `project` parameter to target a different project.
 
     Args:
         project: Project name to build context from. Optional - server will resolve using hierarchy.
@@ -65,13 +164,13 @@ async def build_context(
         page: Page number of results to return (default: 1)
         page_size: Number of results to return per page (default: 10)
         max_related: Maximum number of related results to return (default: 10)
+        output_format: Response format - "json" for structured JSON dict,
+            "text" for compact markdown text
         context: Optional FastMCP context for performance caching.
 
     Returns:
-        GraphContext containing:
-            - primary_results: Content matching the memory:// URI
-            - related_results: Connected content via relations
-            - metadata: Context building details
+        dict (output_format="json"): Structured JSON with internal fields excluded
+        str (output_format="text"): Compact markdown representation
 
     Examples:
         # Continue a specific discussion
@@ -80,16 +179,17 @@ async def build_context(
         # Get deeper context about a component
         build_context("work-docs", "memory://components/memory-service", depth=2)
 
-        # Look at recent changes to a specification
-        build_context("research", "memory://specs/document-format", timeframe="today")
-
-        # Research the history of a feature
-        build_context("dev-notes", "memory://features/knowledge-graph", timeframe="3 months ago")
+        # Get text output for compact context
+        build_context("research", "memory://specs/search", output_format="text")
 
     Raises:
         ToolError: If project doesn't exist or depth parameter is invalid
     """
-    logger.info(f"Building context from {url} in project {project}")
+    # Detect project from memory URL prefix before routing
+    if project is None:
+        detected = detect_project_from_url_prefix(url, ConfigManager().config)
+        if detected:
+            project = detected
 
     # Convert string depth to integer if needed
     if isinstance(depth, str):
@@ -102,42 +202,62 @@ async def build_context(
 
     # URL is already validated and normalized by MemoryUrl type annotation
 
-    # Get the active project using the new stateless approach
-    active_project = await get_active_project(client, project, context)
+    with telemetry.operation(
+        "mcp.tool.build_context",
+        entrypoint="mcp",
+        tool_name="build_context",
+        requested_project=project,
+        workspace_id=workspace,
+        depth=depth or 1,
+        timeframe=timeframe,
+        page=page,
+        page_size=page_size,
+        max_related=max_related,
+        output_format=output_format,
+        is_memory_url=str(url).startswith("memory://"),
+    ):
+        async with get_project_client(project, workspace, context) as (client, active_project):
+            with telemetry.contextualize(
+                project_name=active_project.name,
+                workspace_id=workspace,
+                tool_name="build_context",
+            ):
+                logger.info(
+                    f"MCP tool call tool=build_context project={active_project.name} "
+                    f"url={url} depth={depth} timeframe={timeframe} output_format={output_format}"
+                )
 
-    # Check migration status and wait briefly if needed
-    from basic_memory.mcp.tools.utils import wait_for_migration_or_return_status
+                # Resolve memory:// identifier with project-prefix awareness
+                _, resolved_path, _ = await resolve_project_and_path(
+                    client,
+                    url,
+                    active_project.name,
+                    context,
+                )
 
-    migration_status = await wait_for_migration_or_return_status(
-        timeout=5.0, project_name=active_project.name
-    )
-    if migration_status:  # pragma: no cover
-        # Return a proper GraphContext with status message
-        from basic_memory.schemas.memory import MemoryMetadata
-        from datetime import datetime
+                # Import here to avoid circular import
+                from basic_memory.mcp.clients import MemoryClient
 
-        return GraphContext(
-            results=[],
-            metadata=MemoryMetadata(
-                depth=depth or 1,
-                timeframe=timeframe,
-                generated_at=datetime.now().astimezone(),
-                primary_count=0,
-                related_count=0,
-                uri=migration_status,  # Include status in metadata
-            ),
-        )
-    project_url = active_project.project_url
+                # Use typed MemoryClient for API calls
+                memory_client = MemoryClient(client, active_project.external_id)
+                graph = await memory_client.build_context(
+                    resolved_path,
+                    depth=depth or 1,
+                    timeframe=timeframe,
+                    page=page,
+                    page_size=page_size,
+                    max_related=max_related,
+                )
 
-    response = await call_get(
-        client,
-        f"{project_url}/memory/{memory_url_path(url)}",
-        params={
-            "depth": depth,
-            "timeframe": timeframe,
-            "page": page,
-            "page_size": page_size,
-            "max_related": max_related,
-        },
-    )
-    return GraphContext.model_validate(response.json())
+                logger.info(
+                    f"MCP tool response: tool=build_context project={active_project.name} "
+                    f"uri={graph.metadata.uri or resolved_path} "
+                    f"primary_count={graph.metadata.primary_count or 0} "
+                    f"related_count={graph.metadata.related_count or 0} "
+                    f"output_format={output_format}"
+                )
+
+                if output_format == "text":
+                    return _format_context_markdown(graph, active_project.name)
+
+                return graph.model_dump()

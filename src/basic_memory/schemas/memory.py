@@ -26,6 +26,7 @@ def validate_memory_url_path(path: str) -> bool:
         >>> validate_memory_url_path("invalid://test")  # Contains protocol
         False
     """
+    # Empty paths are not valid
     if not path or not path.strip():
         return False
 
@@ -68,7 +69,13 @@ def normalize_memory_url(url: str | None) -> str:
         ValueError: Invalid memory URL path: 'memory//test' contains double slashes
     """
     if not url:
-        return ""
+        raise ValueError("Memory URL cannot be empty")
+
+    # Strip whitespace for consistency
+    url = url.strip()
+
+    if not url:
+        raise ValueError("Memory URL cannot be empty or whitespace")
 
     clean_path = url.removeprefix("memory://")
 
@@ -79,8 +86,6 @@ def normalize_memory_url(url: str | None) -> str:
             raise ValueError(f"Invalid memory URL path: '{clean_path}' contains protocol scheme")
         elif "//" in clean_path:
             raise ValueError(f"Invalid memory URL path: '{clean_path}' contains double slashes")
-        elif not clean_path.strip():
-            raise ValueError("Memory URL path cannot be empty or whitespace")
         else:
             raise ValueError(f"Invalid memory URL path: '{clean_path}' contains invalid characters")
 
@@ -98,7 +103,7 @@ MemoryUrl = Annotated[
 memory_url = TypeAdapter(MemoryUrl)
 
 
-def memory_url_path(url: memory_url) -> str:  # pyright: ignore
+def memory_url_path(url: str) -> str:
     """
     Returns the uri for a url value by removing the prefix "memory://" from a given MemoryUrl.
 
@@ -119,11 +124,16 @@ class EntitySummary(BaseModel):
     """Simplified entity representation."""
 
     type: Literal["entity"] = "entity"
+    external_id: str  # UUID for v2 API routing
+    # COMPAT(v0.18): old clients expect these fields in JSON
+    entity_id: Optional[int] = None
     permalink: Optional[str]
     title: str
     content: Optional[str] = None
     file_path: str
-    created_at: datetime
+    created_at: Annotated[
+        datetime, Field(json_schema_extra={"type": "string", "format": "date-time"})
+    ]
 
     @field_serializer("created_at")
     def serialize_created_at(self, dt: datetime) -> str:
@@ -134,13 +144,22 @@ class RelationSummary(BaseModel):
     """Simplified relation representation."""
 
     type: Literal["relation"] = "relation"
+    # COMPAT(v0.18): old clients expect these fields in JSON
+    relation_id: Optional[int] = None
+    entity_id: Optional[int] = None
     title: str
     file_path: str
     permalink: str
     relation_type: str
     from_entity: Optional[str] = None
+    from_entity_id: Optional[int] = None
+    from_entity_external_id: Optional[str] = None
     to_entity: Optional[str] = None
-    created_at: datetime
+    to_entity_id: Optional[int] = None
+    to_entity_external_id: Optional[str] = None
+    created_at: Annotated[
+        datetime, Field(json_schema_extra={"type": "string", "format": "date-time"})
+    ]
 
     @field_serializer("created_at")
     def serialize_created_at(self, dt: datetime) -> str:
@@ -151,12 +170,18 @@ class ObservationSummary(BaseModel):
     """Simplified observation representation."""
 
     type: Literal["observation"] = "observation"
-    title: str
+    # COMPAT(v0.18): old clients expect these fields in JSON
+    observation_id: Optional[int] = None
+    entity_id: Optional[int] = None
+    entity_external_id: Optional[str] = None
+    title: Optional[str] = None
     file_path: str
     permalink: str
     category: str
     content: str
-    created_at: datetime
+    created_at: Annotated[
+        datetime, Field(json_schema_extra={"type": "string", "format": "date-time"})
+    ]
 
     @field_serializer("created_at")
     def serialize_created_at(self, dt: datetime) -> str:
@@ -170,16 +195,17 @@ class MemoryMetadata(BaseModel):
     types: Optional[List[SearchItemType]] = None
     depth: int
     timeframe: Optional[str] = None
-    generated_at: datetime
-    primary_count: Optional[int] = None  # Changed field name
-    related_count: Optional[int] = None  # Changed field name
-    total_results: Optional[int] = None  # For backward compatibility
+    # COMPAT(v0.18): old clients expect generated_at and total_results in JSON
+    generated_at: Optional[datetime] = None
+    primary_count: Optional[int] = None
+    related_count: Optional[int] = None
+    total_results: Optional[int] = None
     total_relations: Optional[int] = None
     total_observations: Optional[int] = None
 
     @field_serializer("generated_at")
-    def serialize_generated_at(self, dt: datetime) -> str:
-        return dt.isoformat()
+    def serialize_generated_at(self, dt: Optional[datetime]) -> Optional[str]:
+        return dt.isoformat() if dt else None
 
 
 class ContextResult(BaseModel):
@@ -214,6 +240,7 @@ class GraphContext(BaseModel):
 
     page: Optional[int] = None
     page_size: Optional[int] = None
+    has_more: bool = False
 
 
 class ActivityStats(BaseModel):
@@ -235,14 +262,14 @@ class ProjectActivity(BaseModel):
     project_path: str
     activity: GraphContext = Field(description="The actual activity data for this project")
     item_count: int = Field(description="Total items in this project's activity")
-    last_activity: Optional[datetime] = Field(
-        default=None, description="Most recent activity timestamp"
-    )
+    last_activity: Optional[
+        Annotated[datetime, Field(json_schema_extra={"type": "string", "format": "date-time"})]
+    ] = Field(default=None, description="Most recent activity timestamp")
     active_folders: List[str] = Field(default_factory=list, description="Most active folders")
 
     @field_serializer("last_activity")
     def serialize_last_activity(self, dt: Optional[datetime]) -> Optional[str]:
-        return dt.isoformat() if dt else None
+        return dt.isoformat() if dt else None  # pragma: no cover
 
 
 class ProjectActivitySummary(BaseModel):
@@ -253,11 +280,13 @@ class ProjectActivitySummary(BaseModel):
     )
     summary: ActivityStats
     timeframe: str = Field(description="The timeframe used for the query")
-    generated_at: datetime
+    generated_at: Annotated[
+        datetime, Field(json_schema_extra={"type": "string", "format": "date-time"})
+    ]
     guidance: Optional[str] = Field(
         default=None, description="Assistant guidance for project selection and session management"
     )
 
     @field_serializer("generated_at")
     def serialize_generated_at(self, dt: datetime) -> str:
-        return dt.isoformat()
+        return dt.isoformat()  # pragma: no cover

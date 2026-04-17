@@ -1,20 +1,23 @@
 """Status command for basic-memory CLI."""
 
-import asyncio
+import json
 from typing import Set, Dict
+from typing import Annotated, Optional
 
+from mcp.server.fastmcp.exceptions import ToolError
 import typer
 from loguru import logger
 from rich.console import Console
 from rich.panel import Panel
 from rich.tree import Tree
 
-from basic_memory import db
 from basic_memory.cli.app import app
-from basic_memory.cli.commands.sync import get_sync_service
-from basic_memory.config import ConfigManager, get_project_config
-from basic_memory.repository import ProjectRepository
-from basic_memory.sync.sync_service import SyncReport
+from basic_memory.cli.commands.routing import force_routing, validate_routing_flags
+from basic_memory.config import ConfigManager
+from basic_memory.mcp.async_client import get_client
+from basic_memory.mcp.clients import ProjectClient
+from basic_memory.schemas import SyncReportResponse
+from basic_memory.mcp.project_context import get_active_project
 
 # Create rich console
 console = Console()
@@ -47,7 +50,7 @@ def add_files_to_tree(
                 branch.add(f"[{style}]{file_name}[/{style}]")
 
 
-def group_changes_by_directory(changes: SyncReport) -> Dict[str, Dict[str, int]]:
+def group_changes_by_directory(changes: SyncReportResponse) -> Dict[str, Dict[str, int]]:
     """Group changes by directory for summary view."""
     by_dir = {}
     for change_type, paths in [
@@ -87,11 +90,13 @@ def build_directory_summary(counts: Dict[str, int]) -> str:
     return " ".join(parts)
 
 
-def display_changes(project_name: str, title: str, changes: SyncReport, verbose: bool = False):
+def display_changes(
+    project_name: str, title: str, changes: SyncReportResponse, verbose: bool = False
+):
     """Display changes using Rich for better visualization."""
     tree = Tree(f"{project_name}: {title}")
 
-    if changes.total == 0:
+    if changes.total == 0 and not changes.skipped_files:
         tree.add("No changes")
         console.print(Panel(tree, expand=False))
         return
@@ -111,6 +116,13 @@ def display_changes(project_name: str, title: str, changes: SyncReport, verbose:
         if changes.deleted:
             del_branch = tree.add("[red]Deleted[/red]")
             add_files_to_tree(del_branch, changes.deleted, "red")
+        if changes.skipped_files:
+            skip_branch = tree.add("[red]! Skipped (Circuit Breaker)[/red]")
+            for skipped in sorted(changes.skipped_files, key=lambda x: x.path):
+                skip_branch.add(
+                    f"[red]{skipped.path}[/red] "
+                    f"(failures: {skipped.failure_count}, reason: {skipped.reason})"
+                )
     else:
         # Show directory summaries
         by_dir = group_changes_by_directory(changes)
@@ -119,37 +131,82 @@ def display_changes(project_name: str, title: str, changes: SyncReport, verbose:
             if summary:  # Only show directories with changes
                 tree.add(f"[bold]{dir_name}/[/bold] {summary}")
 
+        # Show skipped files summary in non-verbose mode
+        if changes.skipped_files:
+            skip_count = len(changes.skipped_files)
+            tree.add(
+                f"[red]! {skip_count} file{'s' if skip_count != 1 else ''} "
+                f"skipped due to repeated failures[/red]"
+            )
+
     console.print(Panel(tree, expand=False))
 
 
-async def run_status(verbose: bool = False):  # pragma: no cover
-    """Check sync status of files vs database."""
-    # Check knowledge/ directory
+async def run_status(
+    project: Optional[str] = None,
+) -> tuple[str, SyncReportResponse]:
+    """Fetch sync status of files vs database.
 
-    app_config = ConfigManager().config
-    config = get_project_config()
+    Returns (project_name, sync_report) for the caller to render.
+    """
+    # Resolve default project so get_client() can route per-project
+    project = project or ConfigManager().default_project
 
-    _, session_maker = await db.get_or_create_db(
-        db_path=app_config.database_path, db_type=db.DatabaseType.FILESYSTEM
-    )
-    project_repository = ProjectRepository(session_maker)
-    project = await project_repository.get_by_name(config.project)
-    if not project:  # pragma: no cover
-        raise Exception(f"Project '{config.project}' not found")
-
-    sync_service = await get_sync_service(project)
-    knowledge_changes = await sync_service.scan(config.home)
-    display_changes(project.name, "Status", knowledge_changes, verbose)
+    async with get_client(project_name=project) as client:
+        project_item = await get_active_project(client, project, None)
+        sync_report = await ProjectClient(client).get_status(project_item.external_id)
+        return project_item.name, sync_report
 
 
 @app.command()
 def status(
+    project: Annotated[
+        Optional[str],
+        typer.Option(help="The project name."),
+    ] = None,
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show detailed file information"),
+    json_output: bool = typer.Option(False, "--json", help="Output in JSON format"),
+    local: bool = typer.Option(
+        False, "--local", help="Force local API routing (ignore cloud mode)"
+    ),
+    cloud: bool = typer.Option(False, "--cloud", help="Force cloud API routing"),
 ):
-    """Show sync status between files and database."""
+    """Show sync status between files and database.
+
+    Use --json for machine-readable output.
+    Use --local to force local routing when cloud mode is enabled.
+    Use --cloud to force cloud routing when cloud mode is disabled.
+    """
+    from basic_memory.cli.commands.command_utils import run_with_cleanup
+
     try:
-        asyncio.run(run_status(verbose))  # pragma: no cover
+        validate_routing_flags(local, cloud)
+        # Trigger: no explicit routing flag provided
+        # Why: status scans the local filesystem — cloud routing would use the
+        #      Docker-internal path stored in the cloud database, which doesn't
+        #      exist locally.
+        # Outcome: default to local routing unless --cloud was explicitly requested.
+        if not local and not cloud:
+            local = True
+        with force_routing(local=local, cloud=cloud):
+            project_name, sync_report = run_with_cleanup(run_status(project))
+
+        if json_output:
+            print(json.dumps(sync_report.model_dump(mode="json"), indent=2, default=str))
+        else:
+            display_changes(project_name, "Status", sync_report, verbose)
+    except (ValueError, ToolError) as e:
+        if json_output:
+            print(json.dumps({"error": str(e)}, indent=2))
+        else:
+            console.print(f"[red]Error: {e}[/red]")
+        raise typer.Exit(code=1)
+    except typer.Exit:
+        raise
     except Exception as e:
         logger.error(f"Error checking status: {e}")
-        typer.echo(f"Error checking status: {e}", err=True)
+        if json_output:
+            print(json.dumps({"error": str(e)}, indent=2))
+        else:
+            typer.echo(f"Error checking status: {e}", err=True)
         raise typer.Exit(code=1)  # pragma: no cover

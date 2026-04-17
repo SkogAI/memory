@@ -1,14 +1,13 @@
 from textwrap import dedent
-from typing import Optional
+from typing import Optional, Literal
 
 from loguru import logger
 from fastmcp import Context
+from mcp.server.fastmcp.exceptions import ToolError
 
-from basic_memory.mcp.project_context import get_active_project
-from basic_memory.mcp.tools.utils import call_delete
+from basic_memory.config import ConfigManager
+from basic_memory.mcp.project_context import detect_project_from_url_prefix, get_project_client
 from basic_memory.mcp.server import mcp
-from basic_memory.mcp.async_client import client
-from basic_memory.schemas import DeleteEntitiesResponse
 
 
 def _format_delete_error_response(project: str, error_message: str, identifier: str) -> str:
@@ -148,43 +147,65 @@ delete_note("{project}", "correct-identifier-from-search")
 If the note should be deleted but the operation keeps failing, send a message to support@basicmemory.com."""
 
 
-@mcp.tool(description="Delete a note by title or permalink")
+@mcp.tool(
+    description="Delete a note or directory by title, permalink, or path",
+    annotations={"destructiveHint": True, "openWorldHint": False},
+)
 async def delete_note(
-    identifier: str, project: Optional[str] = None, context: Context | None = None
-) -> bool | str:
-    """Delete a note from the knowledge base.
+    identifier: str,
+    is_directory: bool = False,
+    project: Optional[str] = None,
+    workspace: Optional[str] = None,
+    output_format: Literal["text", "json"] = "text",
+    context: Context | None = None,
+) -> bool | str | dict:
+    """Delete a note or directory from the knowledge base.
 
-    Permanently removes a note from the specified project. The note is identified
-    by title or permalink. If the note doesn't exist, the operation returns False
-    without error. If deletion fails due to other issues, helpful error messages are provided.
+    Permanently removes a note or directory from the specified project. For single notes,
+    they are identified by title or permalink. For directories, use is_directory=True and
+    provide the directory path. If the note/directory doesn't exist, the operation returns
+    False without error. If deletion fails, helpful error messages are provided.
 
     Project Resolution:
     Server resolves projects in this order: Single Project Mode → project parameter → default project.
     If project unknown, use list_memory_projects() or recent_activity() first.
 
     Args:
+        identifier: For files: note title or permalink to delete.
+                   For directories: the directory path (e.g., "docs", "projects/2025").
+                   Can be a title like "Meeting Notes" or permalink like "notes/meeting-notes"
+        is_directory: If True, deletes an entire directory and all its contents.
+                     When True, identifier should be a directory path
+                     (without file extensions). Defaults to False.
         project: Project name to delete from. Optional - server will resolve using hierarchy.
                 If unknown, use list_memory_projects() to discover available projects.
-        identifier: Note title or permalink to delete
-                   Can be a title like "Meeting Notes" or permalink like "notes/meeting-notes"
+        output_format: "text" preserves existing behavior (bool/string). "json"
+            returns machine-readable deletion metadata.
         context: Optional FastMCP context for performance caching.
 
     Returns:
         True if note was successfully deleted, False if note was not found.
+        For directories, returns a formatted summary of deleted files.
         On errors, returns a formatted string with helpful troubleshooting guidance.
 
     Examples:
         # Delete by title
-        delete_note("my-project", "Meeting Notes: Project Planning")
+        delete_note("Meeting Notes: Project Planning")
 
         # Delete by permalink
-        delete_note("work-docs", "notes/project-planning")
+        delete_note("notes/project-planning")
 
-        # Delete with exact path
-        delete_note("research", "experiments/ml-model-results")
+        # Delete with explicit project
+        delete_note("experiments/ml-model-results", project="research")
+
+        # Delete entire directory
+        delete_note("docs", is_directory=True)
+
+        # Delete nested directory
+        delete_note("projects/2024", is_directory=True)
 
         # Common usage pattern
-        if delete_note("my-project", "old-draft"):
+        if delete_note("old-draft"):
             print("Note deleted successfully")
         else:
             print("Note not found or already deleted")
@@ -194,7 +215,7 @@ async def delete_note(
         SecurityError: If identifier attempts path traversal
 
     Warning:
-        This operation is permanent and cannot be undone. The note file
+        This operation is permanent and cannot be undone. The note/directory files
         will be removed from the filesystem and all references will be lost.
 
     Note:
@@ -202,23 +223,184 @@ async def delete_note(
         with suggestions for finding the correct identifier, including search
         commands and alternative formats to try.
     """
-    active_project = await get_active_project(client, project, context)
-    project_url = active_project.project_url
+    # Detect project from memory URL prefix before routing
+    # Trigger: identifier starts with memory:// and no explicit project was provided
+    # Why: only gate on memory:// to avoid misrouting plain paths like "research/note"
+    #      where "research" is a directory, not a project name
+    # Outcome: project is set from the URL prefix, routing goes to the correct project
+    if project is None and identifier.strip().startswith("memory://"):
+        detected = detect_project_from_url_prefix(identifier, ConfigManager().config)
+        if detected:
+            project = detected
 
-    try:
-        response = await call_delete(client, f"{project_url}/knowledge/entities/{identifier}")
-        result = DeleteEntitiesResponse.model_validate(response.json())
+    async with get_project_client(project, workspace, context) as (client, active_project):
+        logger.debug(
+            f"Deleting {'directory' if is_directory else 'note'}: {identifier} in project: {active_project.name}"
+        )
 
-        if result.deleted:
-            logger.info(
-                f"Successfully deleted note: {identifier} in project: {active_project.name}"
+        # Import here to avoid circular import
+        from basic_memory.mcp.clients import KnowledgeClient
+
+        # Use typed KnowledgeClient for API calls
+        knowledge_client = KnowledgeClient(client, active_project.external_id)
+
+        # Handle directory deletes
+        if is_directory:
+            try:
+                result = await knowledge_client.delete_directory(identifier)
+                if output_format == "json":
+                    return {
+                        "deleted": result.failed_deletes == 0,
+                        "is_directory": True,
+                        "identifier": identifier,
+                        "total_files": result.total_files,
+                        "successful_deletes": result.successful_deletes,
+                        "failed_deletes": result.failed_deletes,
+                    }
+
+                # Build success message for directory delete
+                result_lines = [
+                    "# Directory Deleted Successfully",
+                    "",
+                    f"**Directory:** `{identifier}`",
+                    "",
+                    "## Summary",
+                    f"- Total files: {result.total_files}",
+                    f"- Successfully deleted: {result.successful_deletes}",
+                    f"- Failed: {result.failed_deletes}",
+                ]
+
+                if result.deleted_files:
+                    result_lines.extend(["", "## Deleted Files"])
+                    for file_path in result.deleted_files[:10]:  # Show first 10
+                        result_lines.append(f"- `{file_path}`")
+                    if len(result.deleted_files) > 10:
+                        result_lines.append(f"- ... and {len(result.deleted_files) - 10} more")
+
+                if result.errors:  # pragma: no cover
+                    result_lines.extend(["", "## Errors"])
+                    for error in result.errors[:5]:  # Show first 5 errors
+                        result_lines.append(f"- `{error.path}`: {error.error}")
+                    if len(result.errors) > 5:
+                        result_lines.append(f"- ... and {len(result.errors) - 5} more errors")
+
+                result_lines.extend(["", f"<!-- Project: {active_project.name} -->"])
+
+                logger.info(
+                    f"Directory delete completed: {identifier}, "
+                    f"deleted={result.successful_deletes}, failed={result.failed_deletes}"
+                )
+
+                return "\n".join(result_lines)
+
+            except Exception as e:  # pragma: no cover
+                logger.error(f"Directory delete failed for '{identifier}': {e}")
+                if output_format == "json":
+                    return {
+                        "deleted": False,
+                        "is_directory": True,
+                        "identifier": identifier,
+                        "total_files": 0,
+                        "successful_deletes": 0,
+                        "failed_deletes": 0,
+                        "error": str(e),
+                    }
+                return f"""# Directory Delete Failed
+
+Error deleting directory '{identifier}': {str(e)}
+
+## Troubleshooting:
+1. **Verify the directory exists**: Use `list_directory("{identifier}")` to check
+2. **Check for permission issues**: Ensure you have delete access to the project
+3. **Try individual deletes**: Delete files one at a time if bulk delete fails
+
+## Alternative approach:
+```
+# List directory contents first
+list_directory("{identifier}")
+
+# Then delete individual files
+delete_note("path/to/file.md")
+```"""
+
+        # Handle single note deletes
+        note_title = None
+        note_permalink = None
+        note_file_path = None
+        try:
+            # Resolve identifier to entity ID
+            entity_id = await knowledge_client.resolve_entity(identifier, strict=True)
+            if output_format == "json":
+                entity = await knowledge_client.get_entity(entity_id)
+                note_title = entity.title
+                note_permalink = entity.permalink
+                note_file_path = entity.file_path
+        except ToolError as e:
+            # If entity not found, return False (note doesn't exist)
+            if "Entity not found" in str(e) or "not found" in str(e).lower():
+                logger.warning(f"Note not found for deletion: {identifier}")
+                if output_format == "json":
+                    return {
+                        "deleted": False,
+                        "title": None,
+                        "permalink": None,
+                        "file_path": None,
+                    }
+                return False
+            # For other resolution errors, return formatted error message
+            logger.error(  # pragma: no cover
+                f"Delete failed for '{identifier}': {e}, project: {active_project.name}"
             )
-            return True
-        else:
-            logger.warning(f"Delete operation completed but note was not deleted: {identifier}")
-            return False
+            if output_format == "json":
+                return {
+                    "deleted": False,
+                    "title": None,
+                    "permalink": None,
+                    "file_path": None,
+                    "error": str(e),
+                }
+            return _format_delete_error_response(  # pragma: no cover
+                active_project.name, str(e), identifier
+            )
 
-    except Exception as e:  # pragma: no cover
-        logger.error(f"Delete failed for '{identifier}': {e}, project: {active_project.name}")
-        # Return formatted error message for better user experience
-        return _format_delete_error_response(active_project.name, str(e), identifier)
+        try:
+            # Call the DELETE endpoint
+            result = await knowledge_client.delete_entity(entity_id)
+
+            if result.deleted:
+                logger.info(
+                    f"Successfully deleted note: {identifier} in project: {active_project.name}"
+                )
+                if output_format == "json":
+                    return {
+                        "deleted": True,
+                        "title": note_title,
+                        "permalink": note_permalink,
+                        "file_path": note_file_path,
+                    }
+                return True
+            else:
+                logger.warning(  # pragma: no cover
+                    f"Delete operation completed but note was not deleted: {identifier}"
+                )
+                if output_format == "json":
+                    return {
+                        "deleted": False,
+                        "title": note_title,
+                        "permalink": note_permalink,
+                        "file_path": note_file_path,
+                    }
+                return False  # pragma: no cover
+
+        except Exception as e:  # pragma: no cover
+            logger.error(f"Delete failed for '{identifier}': {e}, project: {active_project.name}")
+            if output_format == "json":
+                return {
+                    "deleted": False,
+                    "title": note_title,
+                    "permalink": note_permalink,
+                    "file_path": note_file_path,
+                    "error": str(e),
+                }
+            # Return formatted error message for better user experience
+            return _format_delete_error_response(active_project.name, str(e), identifier)

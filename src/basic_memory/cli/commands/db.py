@@ -1,13 +1,86 @@
 """Database management commands."""
 
-import asyncio
+from dataclasses import dataclass
+from pathlib import Path
 
 import typer
 from loguru import logger
+from rich.console import Console
+from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TaskProgressColumn
+from sqlalchemy.exc import OperationalError
 
 from basic_memory import db
 from basic_memory.cli.app import app
-from basic_memory.config import ConfigManager, BasicMemoryConfig, save_basic_memory_config
+from basic_memory.cli.commands.command_utils import run_with_cleanup
+from basic_memory.config import ConfigManager, ProjectMode
+from basic_memory.indexing import IndexProgress
+from basic_memory.repository import ProjectRepository
+from basic_memory.services.initialization import reconcile_projects_with_config
+from basic_memory.sync.sync_service import get_sync_service
+
+console = Console()
+
+
+@dataclass(slots=True)
+class EmbeddingProgress:
+    """Typed CLI progress payload for embedding backfills."""
+
+    entity_id: int
+    completed: int
+    total: int
+
+
+def _format_eta(seconds: float | None) -> str:
+    """Render a compact ETA string for CLI progress descriptions."""
+    if seconds is None:
+        return "--:--"
+
+    whole_seconds = max(int(seconds), 0)
+    minutes, remaining_seconds = divmod(whole_seconds, 60)
+    hours, remaining_minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours:d}:{remaining_minutes:02d}:{remaining_seconds:02d}"
+    return f"{remaining_minutes:02d}:{remaining_seconds:02d}"
+
+
+def _format_index_progress(progress: IndexProgress) -> str:
+    """Render typed index progress as a compact Rich task description."""
+    files_per_minute = int(progress.files_per_minute) if progress.files_per_minute else 0
+    return (
+        "  Indexing files... "
+        f"{progress.files_processed}/{progress.files_total} files | "
+        f"{progress.batches_completed}/{progress.batches_total} batches | "
+        f"{files_per_minute}/min | ETA {_format_eta(progress.eta_seconds)}"
+    )
+
+
+async def _reindex_projects(app_config):
+    """Reindex all projects in a single async context.
+
+    This ensures all database operations use the same event loop,
+    and proper cleanup happens when the function completes.
+    """
+    try:
+        await reconcile_projects_with_config(app_config)
+
+        # Get database session (migrations already run if needed)
+        _, session_maker = await db.get_or_create_db(
+            db_path=app_config.database_path,
+            db_type=db.DatabaseType.FILESYSTEM,
+        )
+        project_repository = ProjectRepository(session_maker)
+        projects = await project_repository.get_active_projects()
+
+        for project in projects:
+            console.print(f"  Indexing [cyan]{project.name}[/cyan]...")
+            logger.info(f"Starting sync for project: {project.name}")
+            sync_service = await get_sync_service(project)
+            sync_dir = Path(project.path)
+            await sync_service.sync(sync_dir, project_name=project.name)
+            logger.info(f"Sync completed for project: {project.name}")
+    finally:
+        # Clean up database connections before event loop closes
+        await db.shutdown_db()
 
 
 @app.command()
@@ -15,30 +88,246 @@ def reset(
     reindex: bool = typer.Option(False, "--reindex", help="Rebuild db index from filesystem"),
 ):  # pragma: no cover
     """Reset database (drop all tables and recreate)."""
-    if typer.confirm("This will delete all data in your db. Are you sure?"):
+    console.print(
+        "[yellow]Note:[/yellow] This only deletes the index database. "
+        "Your markdown note files will not be affected.\n"
+        "Use [green]bm reset --reindex[/green] to automatically rebuild the index afterward."
+    )
+    if typer.confirm("Reset the database index?"):
         logger.info("Resetting database...")
         config_manager = ConfigManager()
         app_config = config_manager.config
         # Get database path
         db_path = app_config.app_database_path
 
-        # Delete the database file if it exists
-        if db_path.exists():
-            db_path.unlink()
-            logger.info(f"Database file deleted: {db_path}")
+        # Delete the database file and WAL files if they exist
+        for suffix in ["", "-shm", "-wal"]:
+            path = db_path.parent / f"{db_path.name}{suffix}"
+            if path.exists():
+                try:
+                    path.unlink()
+                    logger.info(f"Deleted: {path}")
+                except OSError as e:
+                    console.print(
+                        f"[red]Error:[/red] Cannot delete {path.name}: {e}\n"
+                        "The database may be in use by another process (e.g., MCP server).\n"
+                        "Please close Claude Desktop or any other Basic Memory clients and try again."
+                    )
+                    raise typer.Exit(1)
 
-        # Reset project configuration
-        config = BasicMemoryConfig()
-        save_basic_memory_config(config_manager.config_file, config)
-        logger.info("Project configuration reset to default")
-
-        # Create a new empty database
-        asyncio.run(db.run_migrations(app_config))
-        logger.info("Database reset complete")
+        # Create a new empty database (preserves project configuration)
+        try:
+            run_with_cleanup(db.run_migrations(app_config))
+        except OperationalError as e:
+            if "disk I/O error" in str(e) or "database is locked" in str(e):
+                console.print(
+                    "[red]Error:[/red] Cannot access database. "
+                    "It may be in use by another process (e.g., MCP server).\n"
+                    "Please close Claude Desktop or any other Basic Memory clients and try again."
+                )
+                raise typer.Exit(1)
+            raise
+        console.print("[green]Database reset complete[/green]")
 
         if reindex:
-            # Import and run sync
-            from basic_memory.cli.commands.sync import sync
+            projects = list(app_config.projects)
+            if not projects:
+                console.print("[yellow]No projects configured. Skipping reindex.[/yellow]")
+            else:
+                console.print(f"Rebuilding search index for {len(projects)} project(s)...")
+                # Note: _reindex_projects has its own cleanup, but run_with_cleanup
+                # ensures db.shutdown_db() is called even if _reindex_projects changes
+                run_with_cleanup(_reindex_projects(app_config))
+                console.print("[green]Reindex complete[/green]")
 
-            logger.info("Rebuilding search index from filesystem...")
-            sync(watch=False)  # pyright: ignore
+
+@app.command()
+def reindex(
+    embeddings: bool = typer.Option(
+        False, "--embeddings", "-e", help="Rebuild vector embeddings (requires semantic search)"
+    ),
+    search: bool = typer.Option(False, "--search", "-s", help="Rebuild full-text search index"),
+    full: bool = typer.Option(
+        False,
+        "--full",
+        help="Force a full filesystem scan and file reindex instead of the default incremental scan",
+    ),
+    project: str = typer.Option(
+        None, "--project", "-p", help="Reindex a specific project (default: all)"
+    ),
+):  # pragma: no cover
+    """Rebuild search indexes and/or vector embeddings without dropping the database.
+
+    By default runs incremental search + embeddings (if semantic search is enabled).
+    Use --full to bypass incremental scan optimization, rebuild all file-backed search rows,
+    and re-embed all eligible notes.
+    Use --search or --embeddings to rebuild only one side.
+
+    Examples:
+        bm reindex                  # Incremental search + embeddings
+        bm reindex --full           # Full search + full re-embed
+        bm reindex --embeddings     # Only rebuild vector embeddings
+        bm reindex --search         # Only rebuild FTS index
+        bm reindex --full --search  # Full search only
+        bm reindex --full --embeddings  # Full re-embed only
+        bm reindex -p claw --full   # Full reindex for only the 'claw' project
+    """
+    # If neither flag is set, do both
+    if not embeddings and not search:
+        embeddings = True
+        search = True
+
+    config_manager = ConfigManager()
+    app_config = config_manager.config
+
+    if embeddings and not app_config.semantic_search_enabled:
+        console.print(
+            "[yellow]Semantic search is not enabled.[/yellow] "
+            "Set [cyan]semantic_search_enabled: true[/cyan] in config to use embeddings."
+        )
+        embeddings = False
+        if not search:
+            raise typer.Exit(0)
+
+    run_with_cleanup(
+        _reindex(app_config, search=search, embeddings=embeddings, full=full, project=project)
+    )
+
+
+async def _reindex(
+    app_config,
+    *,
+    search: bool,
+    embeddings: bool,
+    full: bool,
+    project: str | None,
+):
+    """Run reindex operations."""
+    from basic_memory.repository import EntityRepository
+    from basic_memory.repository.search_repository import create_search_repository
+    from basic_memory.services.search_service import SearchService
+    from basic_memory.services.file_service import FileService
+    from basic_memory.markdown.markdown_processor import MarkdownProcessor
+    from basic_memory.markdown.entity_parser import EntityParser
+
+    try:
+        await reconcile_projects_with_config(app_config)
+
+        _, session_maker = await db.get_or_create_db(
+            db_path=app_config.database_path,
+            db_type=db.DatabaseType.FILESYSTEM,
+        )
+        project_repository = ProjectRepository(session_maker)
+        projects = await project_repository.get_active_projects()
+
+        if project:
+            projects = [p for p in projects if p.name == project]
+            if not projects:
+                # Check if it's a cloud-only project — those can't be reindexed locally
+                project_mode = app_config.get_project_mode(project)
+                if project_mode == ProjectMode.CLOUD:
+                    console.print(
+                        f"[yellow]Project '{project}' is a cloud project.[/yellow]\n"
+                        "Reindexing is a local operation — cloud projects are "
+                        "indexed on the server."
+                    )
+                else:
+                    console.print(f"[red]Project '{project}' not found.[/red]")
+                raise typer.Exit(1)
+
+        for proj in projects:
+            console.print(f"\n[bold]Project: [cyan]{proj.name}[/cyan][/bold]")
+
+            if search:
+                search_mode_label = "full scan" if full else "incremental scan"
+                console.print(
+                    f"  Rebuilding full-text search index ([cyan]{search_mode_label}[/cyan])..."
+                )
+                sync_service = await get_sync_service(proj)
+                sync_dir = Path(proj.path)
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task("  Indexing files... scanning changes", total=1)
+
+                    async def on_index_progress(update: IndexProgress) -> None:
+                        total = update.files_total or 1
+                        completed = update.files_processed if update.files_total else 1
+                        progress.update(
+                            task,
+                            description=_format_index_progress(update),
+                            total=total,
+                            completed=min(completed, total),
+                        )
+
+                    await sync_service.sync(
+                        sync_dir,
+                        project_name=proj.name,
+                        force_full=full,
+                        sync_embeddings=False,
+                        progress_callback=on_index_progress,
+                    )
+                    progress.update(task, completed=progress.tasks[task].total or 1)
+
+                console.print("  [green]done[/green] Full-text search index rebuilt")
+
+            if embeddings:
+                embedding_mode_label = "full rebuild" if full else "incremental sync"
+                console.print(
+                    f"  Building vector embeddings ([cyan]{embedding_mode_label}[/cyan])..."
+                )
+                entity_repository = EntityRepository(session_maker, project_id=proj.id)
+                search_repository = create_search_repository(
+                    session_maker, project_id=proj.id, app_config=app_config
+                )
+                project_path = Path(proj.path)
+                entity_parser = EntityParser(project_path)
+                markdown_processor = MarkdownProcessor(entity_parser, app_config=app_config)
+                file_service = FileService(project_path, markdown_processor, app_config=app_config)
+                search_service = SearchService(search_repository, entity_repository, file_service)
+
+                with Progress(
+                    SpinnerColumn(),
+                    TextColumn("[progress.description]{task.description}"),
+                    BarColumn(),
+                    TaskProgressColumn(),
+                    console=console,
+                ) as progress:
+                    task = progress.add_task("  Embedding entities...", total=None)
+
+                    def on_progress(entity_id, index, total):
+                        embedding_progress = EmbeddingProgress(
+                            entity_id=entity_id,
+                            completed=index,
+                            total=total,
+                        )
+                        # Trigger: repository progress now reports terminal entity completion.
+                        # Why: operators need to see finished embedding work rather than
+                        # entities merely entering prepare.
+                        # Outcome: the CLI bar advances steadily with real completed work.
+                        progress.update(
+                            task,
+                            total=embedding_progress.total,
+                            completed=embedding_progress.completed,
+                        )
+
+                    stats = await search_service.reindex_vectors(
+                        progress_callback=on_progress,
+                        force_full=full,
+                    )
+                    progress.update(task, completed=stats["total_entities"])
+
+                console.print(
+                    f"  [green]done[/green] Embeddings complete: "
+                    f"{stats['embedded']} entities embedded, "
+                    f"{stats['skipped']} skipped, "
+                    f"{stats['errors']} errors"
+                )
+
+        console.print("\n[green]Reindex complete![/green]")
+    finally:
+        await db.shutdown_db()

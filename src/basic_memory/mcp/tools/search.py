@@ -1,22 +1,80 @@
 """Search tools for Basic Memory MCP server."""
 
+import re
 from textwrap import dedent
-from typing import List, Optional
+from typing import Annotated, List, Optional, Dict, Any, Literal
 
 from loguru import logger
 from fastmcp import Context
+from pydantic import BeforeValidator
 
-from basic_memory.mcp.async_client import client
-from basic_memory.mcp.project_context import get_active_project
+from basic_memory import telemetry
+from basic_memory.config import ConfigManager
+from basic_memory.utils import coerce_dict, coerce_list
+from basic_memory.mcp.container import get_container
+from basic_memory.mcp.project_context import (
+    detect_project_from_url_prefix,
+    get_project_client,
+    resolve_project_and_path,
+)
 from basic_memory.mcp.server import mcp
-from basic_memory.mcp.tools.utils import call_post
-from basic_memory.schemas.search import SearchItemType, SearchQuery, SearchResponse
+from basic_memory.schemas.search import (
+    SearchItemType,
+    SearchQuery,
+    SearchResponse,
+    SearchRetrievalMode,
+)
+
+
+def _default_search_type() -> str:
+    """Pick default search mode from config, falling back to auto-detection.
+
+    Priority: config default_search_type > auto-detect (hybrid if semantic enabled, else text).
+    """
+    try:
+        config = get_container().config
+    except RuntimeError:
+        config = ConfigManager().config
+
+    if config.default_search_type:
+        return config.default_search_type
+
+    return "hybrid" if config.semantic_search_enabled else "text"
 
 
 def _format_search_error_response(
     project: str, error_message: str, query: str, search_type: str = "text"
 ) -> str:
     """Format helpful error responses for search failures that guide users to successful searches."""
+
+    # Semantic config/dependency errors
+    if "semantic search is disabled" in error_message.lower():
+        return dedent(f"""
+            # Search Failed - Semantic Search Disabled
+
+            You requested `{search_type}` search for query '{query}', but semantic search is disabled.
+
+            ## How to enable
+            1. Set `BASIC_MEMORY_SEMANTIC_SEARCH_ENABLED=true`
+            2. Restart the Basic Memory server/process
+
+            ## Alternative now
+            - Run FTS search instead:
+              `search_notes("{project}", "{query}", search_type="text")`
+            """).strip()
+
+    if "pip install" in error_message.lower() and "semantic" in error_message.lower():
+        return dedent(f"""
+            # Search Failed - Semantic Dependencies Missing
+
+            Semantic retrieval is enabled but required packages are not installed.
+
+            ## Fix
+            1. Install/update Basic Memory: `pip install -U basic-memory`
+            2. Restart Basic Memory
+            3. Retry your query:
+               `search_notes("{project}", "{query}", search_type="{search_type}")`
+            """).strip()
 
     # FTS5 syntax errors
     if "syntax error" in error_message.lower() or "fts5" in error_message.lower():
@@ -59,7 +117,7 @@ def _format_search_error_response(
             ## Alternative search strategies:
             - Break into simpler terms: `search_notes("{project}", "{" ".join(clean_query.split()[:2])}")`
             - Try different search types: `search_notes("{project}","{clean_query}", search_type="title")`
-            - Use filtering: `search_notes("{project}","{clean_query}", types=["entity"])`
+            - Use filtering: `search_notes("{project}","{clean_query}", note_types=["note"])`
             """).strip()
 
     # Project not found errors (check before general "not found")
@@ -110,7 +168,7 @@ def _format_search_error_response(
                - Remove restrictive terms: Focus on the most important keywords
 
             5. **Use filtering to narrow scope**:
-               - By content type: `search_notes("{project}","{query}", types=["entity"])`
+               - By note type in frontmatter: `search_notes("{project}","{query}", note_types=["note"])`
                - By recent content: `search_notes("{project}","{query}", after_date="1 week")`
                - By entity type: `search_notes("{project}","{query}", entity_types=["observation"])`
 
@@ -179,7 +237,7 @@ Error searching for '{query}': {error_message}
 - **Different search types**: 
   - Title only: `search_notes("{project}","{query}", search_type="title")`
   - Permalink patterns: `search_notes("{project}","{query}*", search_type="permalink")`
-- **With filters**: `search_notes("{project}","{query}", types=["entity"])`
+- **With filters**: `search_notes("{project}","{query}", note_types=["note"])`
 - **Recent content**: `search_notes("{project}","{query}", after_date="1 week")`
 - **Boolean variations**: `search_notes("{project}","{" OR ".join(query.split()[:2])}")`
 
@@ -196,20 +254,86 @@ Error searching for '{query}': {error_message}
 - **Patterns**: `tag:example`, `category:observation`"""
 
 
+def _format_search_markdown(result: SearchResponse, project: str, query: str | None) -> str:
+    """Format SearchResponse as compact markdown text.
+
+    Produces a human-readable markdown representation suitable for LLM
+    consumption when structured data isn't needed.
+    """
+    if not result.results:
+        return f"No results found for '{query or ''}' in project '{project}'."
+
+    parts = []
+
+    # --- Header ---
+    if query:
+        parts.append(f"# Search Results: {query}")
+    else:
+        parts.append("# Search Results")
+    parts.append(f"*project: {project}*")
+    parts.append("")
+
+    # --- Result blocks ---
+    for r in result.results:
+        parts.append(f"### {r.title}")
+        parts.append(f"- permalink: {r.permalink}")
+        parts.append(f"- score: {r.score:.4f}")
+        if r.matched_chunk:
+            parts.append(f"- match: {r.matched_chunk[:200]}")
+        parts.append("")
+
+    # --- Footer with pagination ---
+    parts.append("---")
+    count = len(result.results)
+    parts.append(
+        f"*{count} result{'s' if count != 1 else ''}"
+        f" | page {result.current_page}, page_size {result.page_size}"
+        f"{' | more available' if result.has_more else ''}*"
+    )
+
+    return "\n".join(parts)
+
+
 @mcp.tool(
     description="Search across all content in the knowledge base with advanced syntax support.",
+    # TODO: re-enable once MCP client rendering is working
+    # meta={"ui/resourceUri": "ui://basic-memory/search-results"},
+    annotations={"readOnlyHint": True, "openWorldHint": False},
 )
 async def search_notes(
-    query: str,
+    query: Optional[str] = None,
     project: Optional[str] = None,
+    workspace: Optional[str] = None,
     page: int = 1,
     page_size: int = 10,
-    search_type: str = "text",
-    types: Optional[List[str]] = None,
-    entity_types: Optional[List[str]] = None,
+    search_type: str | None = None,
+    output_format: Literal["text", "json"] = "text",
+    note_types: Annotated[
+        List[str] | None,
+        BeforeValidator(coerce_list),
+        "Filter by the 'type' field in note frontmatter (e.g. 'note', 'chapter', 'person'). "
+        "Case-insensitive.",
+    ] = None,
+    entity_types: Annotated[
+        List[str] | None,
+        BeforeValidator(coerce_list),
+        "Filter by knowledge graph item type: 'entity' (whole notes), 'observation', or "
+        "'relation'. Defaults to 'entity'. Do NOT pass schema/frontmatter types like "
+        "'Chapter' here — use note_types instead.",
+    ] = None,
     after_date: Optional[str] = None,
+    metadata_filters: Annotated[
+        Dict[str, Any] | None,
+        BeforeValidator(coerce_dict),
+    ] = None,
+    tags: Annotated[
+        List[str] | None,
+        BeforeValidator(coerce_list),
+    ] = None,
+    status: Optional[str] = None,
+    min_similarity: Optional[float] = None,
     context: Context | None = None,
-) -> SearchResponse | str:
+) -> dict | str:
     """Search across all content in the knowledge base with comprehensive syntax support.
 
     This tool searches the knowledge base using full-text search, pattern matching,
@@ -227,7 +351,8 @@ async def search_notes(
     - `search_notes("work-docs", "'exact phrase'")` - Search for exact phrase match
 
     ### Advanced Boolean Searches
-    - `search_notes("my-project", "term1 term2")` - Find content with both terms (implicit AND)
+    - `search_notes("my-project", "term1 term2")` - Strict implicit-AND first; retries with
+      relaxed OR terms only if strict search returns no results
     - `search_notes("my-project", "term1 AND term2")` - Explicit AND search (both terms required)
     - `search_notes("my-project", "term1 OR term2")` - Either term can be present
     - `search_notes("my-project", "term1 NOT term2")` - Include term1 but exclude term2
@@ -238,17 +363,46 @@ async def search_notes(
     - `search_notes("work-project", "category:observation")` - Filter by observation categories
     - `search_notes("team-docs", "author:username")` - Find content by author (if metadata available)
 
+    **Note:** `tag:` shorthand is automatically converted to a `tags` filter, so it works
+    with any search type (text, hybrid, vector). You can also use the `tags` parameter
+    directly: `search_notes("project", "query", tags=["my-tag"])`
+
     ### Search Type Examples
     - `search_notes("my-project", "Meeting", search_type="title")` - Search only in titles
     - `search_notes("work-docs", "docs/meeting-*", search_type="permalink")` - Pattern match permalinks
-    - `search_notes("research", "keyword", search_type="text")` - Full-text search (default)
+      Note: Permalink patterns match the full path (e.g., "project/folder/chapter-13*", not just "chapter-13*").
+    - `search_notes("research", "keyword")` - Default search (hybrid when semantic is enabled,
+      text when disabled)
 
     ### Filtering Options
-    - `search_notes("my-project", "query", types=["entity"])` - Search only entities
-    - `search_notes("work-docs", "query", types=["note", "person"])` - Multiple content types
+    - `search_notes("my-project", "query", note_types=["note"])` - Search only notes
+    - `search_notes("work-docs", "query", note_types=["note", "person"])` - Multiple note types
     - `search_notes("research", "query", entity_types=["observation"])` - Filter by entity type
     - `search_notes("team-docs", "query", after_date="2024-01-01")` - Recent content only
     - `search_notes("my-project", "query", after_date="1 week")` - Relative date filtering
+    - `search_notes("my-project", "query", tags=["security"])` - Filter by frontmatter tags
+    - `search_notes("my-project", "query", status="in-progress")` - Filter by frontmatter status
+    - `search_notes("my-project", "query", metadata_filters={"priority": {"$in": ["high"]}})`
+
+    ### Structured Metadata Filters
+    Filters are exact matches on frontmatter metadata. Supported forms:
+    - Equality: `{"status": "in-progress"}`
+    - Array contains (all): `{"tags": ["security", "oauth"]}`
+    - Operators:
+      - `$in`: `{"priority": {"$in": ["high", "critical"]}}`
+      - `$gt`, `$gte`, `$lt`, `$lte`: `{"schema.confidence": {"$gt": 0.7}}`
+      - `$between`: `{"schema.confidence": {"$between": [0.3, 0.6]}}`
+    - Nested keys use dot notation (e.g., `"schema.confidence"`).
+
+    ### Filter-only Searches
+    Omit `query` (or pass None) when only using structured filters:
+    - `search_notes(metadata_filters={"type": "spec"}, project="my-project")`
+    - `search_notes(tags=["security"], project="my-project")`
+    - `search_notes(status="draft", project="my-project")`
+
+    ### Convenience Filters
+    `tags` and `status` are shorthand for metadata_filters. If the same key exists in
+    metadata_filters, that value wins.
 
     ### Advanced Pattern Examples
     - `search_notes("work-project", "project AND (meeting OR discussion)")` - Complex boolean logic
@@ -257,23 +411,36 @@ async def search_notes(
     - `search_notes("archive", "docs/2024-*", search_type="permalink")` - Year-based permalink search
 
     Args:
-        query: The search query string (supports boolean operators, phrases, patterns)
+        query: Optional search query string (supports boolean operators, phrases, patterns).
+              Omit or pass None for filter-only searches using metadata_filters, tags, or status.
         project: Project name to search in. Optional - server will resolve using hierarchy.
                 If unknown, use list_memory_projects() to discover available projects.
         page: The page number of results to return (default 1)
         page_size: The number of results to return per page (default 10)
-        search_type: Type of search to perform, one of: "text", "title", "permalink" (default: "text")
-        types: Optional list of note types to search (e.g., ["note", "person"])
+        search_type: Type of search to perform, one of:
+                    "text", "title", "permalink", "vector", "semantic", "hybrid".
+                    Default is dynamic: "hybrid" when semantic search is enabled, otherwise "text".
+        output_format: "text" preserves existing structured search response behavior.
+            "json" returns a machine-readable dictionary payload.
+        note_types: Optional list of note types to search (e.g., ["note", "person"])
         entity_types: Optional list of entity types to filter by (e.g., ["entity", "observation"])
         after_date: Optional date filter for recent content (e.g., "1 week", "2d", "2024-01-01")
+        metadata_filters: Optional structured frontmatter filters (e.g., {"status": "in-progress"})
+        tags: Optional tag filter (frontmatter tags); shorthand for metadata_filters["tags"]
+        status: Optional status filter (frontmatter status); shorthand for metadata_filters["status"]
+        min_similarity: Optional float to override the global semantic_min_similarity threshold
+                       for this query. E.g., 0.0 to see all vector results, or 0.8 for high precision.
+                       Only applies to vector and hybrid search types.
         context: Optional FastMCP context for performance caching.
 
     Returns:
-        SearchResponse with results and pagination info, or helpful error guidance if search fails
+        Formatted markdown text (output_format="text"), dict (output_format="json"),
+        or helpful error guidance string if search fails
 
     Examples:
         # Basic text search
         results = await search_notes("project planning")
+        # Plain multi-term text uses strict matching first, then relaxed OR fallback if needed
 
         # Boolean AND search (both terms must be present)
         results = await search_notes("project AND planning")
@@ -290,10 +457,10 @@ async def search_notes(
         # Exact phrase search
         results = await search_notes("\"weekly standup meeting\"")
 
-        # Search with type filter
+        # Search with note type filter - type property in frontmatter
         results = await search_notes(
             "meeting notes",
-            types=["entity"],
+            note_types=["note"],
         )
 
         # Search with entity type filter
@@ -323,61 +490,193 @@ async def search_notes(
         # Complex search with multiple filters
         results = await search_notes(
             "(bug OR issue) AND NOT resolved",
-            types=["entity"],
+            note_types=["note"],
             after_date="2024-01-01"
         )
 
         # Explicit project specification
         results = await search_notes("project planning", project="my-project")
     """
-    # Create a SearchQuery object based on the parameters
-    search_query = SearchQuery()
+    # Avoid mutable-default-argument footguns. Treat None as "no filter".
+    # Lowercase note_types so "Chapter" matches the stored "chapter".
+    note_types = [t.lower() for t in note_types] if note_types else []
+    entity_types = entity_types or []
 
-    # Set the appropriate search field based on search_type
-    if search_type == "text":
-        search_query.text = query
-    elif search_type == "title":
-        search_query.title = query
-    elif search_type == "permalink" and "*" in query:
-        search_query.permalink_match = query
-    elif search_type == "permalink":
-        search_query.permalink = query
-    else:
-        search_query.text = query  # Default to text search
+    # Parse tag:<value> shorthand at tool level so it works with all search modes.
+    # Handles "tag:security", "tag:coffee tag:brewing", "tag:coffee AND tag:brewing".
+    # Without this, hybrid/vector modes fail because they require non-empty text,
+    # but the service-layer tag: parser clears the text after the mode is set.
+    if query and "tag:" in query.lower():
+        # Extract tag values, splitting comma-separated lists (e.g. "tag:coffee,brewing")
+        raw_values = re.findall(r"tag:(\S+)", query, flags=re.IGNORECASE)
+        tag_values = [v for raw in raw_values for v in raw.split(",") if v]
+        if tag_values:
+            # Merge with any explicitly provided tags
+            tags = list(set((tags or []) + tag_values))
+            # Remove tag: tokens and boolean connectors, keep remaining text as query
+            remainder = re.sub(r"tag:\S+", "", query, flags=re.IGNORECASE)
+            remainder = re.sub(r"\b(AND|OR|NOT)\b", "", remainder).strip()
+            query = remainder or None
 
-    # Add optional filters if provided
-    if entity_types:
-        search_query.entity_types = [SearchItemType(t) for t in entity_types]
-    if types:
-        search_query.types = types
-    if after_date:
-        search_query.after_date = after_date
+    # Detect project from memory URL prefix before routing
+    if project is None and query is not None:
+        detected = detect_project_from_url_prefix(query, ConfigManager().config)
+        if detected:
+            project = detected
 
-    active_project = await get_active_project(client, project, context)
-    project_url = active_project.project_url
+    with telemetry.operation(
+        "mcp.tool.search_notes",
+        entrypoint="mcp",
+        tool_name="search_notes",
+        requested_project=project,
+        workspace_id=workspace,
+        search_type=search_type or "default",
+        output_format=output_format,
+        page=page,
+        page_size=page_size,
+        has_query=bool(query and query.strip()),
+        note_type_filter_count=len(note_types),
+        entity_type_filter_count=len(entity_types),
+        has_filters=bool(
+            metadata_filters or tags or status or note_types or entity_types or after_date
+        ),
+        has_tags_filter=bool(tags),
+        has_status_filter=bool(status),
+    ):
+        async with get_project_client(project, workspace, context) as (client, active_project):
+            with telemetry.contextualize(
+                project_name=active_project.name,
+                workspace_id=workspace,
+                tool_name="search_notes",
+            ):
+                # Handle memory:// URLs by resolving to permalink search
+                is_memory_url = False
+                if query is not None:
+                    _, resolved_query, is_memory_url = await resolve_project_and_path(
+                        client, query, project, context
+                    )
+                    if is_memory_url:
+                        query = resolved_query
+                effective_search_type = search_type or _default_search_type()
+                if is_memory_url:
+                    effective_search_type = "permalink"
 
-    logger.info(f"Searching for {search_query} in project {active_project.name}")
+                try:
+                    # Create a SearchQuery object based on the parameters
+                    search_query = SearchQuery()
 
-    try:
-        response = await call_post(
-            client,
-            f"{project_url}/search/",
-            json=search_query.model_dump(),
-            params={"page": page, "page_size": page_size},
-        )
-        result = SearchResponse.model_validate(response.json())
+                    # Only map search_type to query fields when there is an actual query string.
+                    # When query is None/empty, skip the search mode block — filters-only path.
+                    effective_query = (query or "").strip()
+                    if effective_query:
+                        valid_search_types = {
+                            "text",
+                            "title",
+                            "permalink",
+                            "vector",
+                            "semantic",
+                            "hybrid",
+                        }
+                        if effective_search_type == "text":
+                            search_query.text = effective_query
+                            search_query.retrieval_mode = SearchRetrievalMode.FTS
+                        elif effective_search_type in ("vector", "semantic"):
+                            search_query.text = effective_query
+                            search_query.retrieval_mode = SearchRetrievalMode.VECTOR
+                        elif effective_search_type == "hybrid":
+                            search_query.text = effective_query
+                            search_query.retrieval_mode = SearchRetrievalMode.HYBRID
+                        elif effective_search_type == "title":
+                            search_query.title = effective_query
+                        elif effective_search_type == "permalink" and "*" in effective_query:
+                            search_query.permalink_match = effective_query
+                        elif effective_search_type == "permalink":
+                            search_query.permalink = effective_query
+                        else:
+                            raise ValueError(
+                                f"Invalid search_type '{effective_search_type}'. "
+                                f"Valid options: {', '.join(sorted(valid_search_types))}"
+                            )
 
-        # Check if we got no results and provide helpful guidance
-        if not result.results:
-            logger.info(
-                f"Search returned no results for query: {query} in project {active_project.name}"
-            )
-            # Don't treat this as an error, but the user might want guidance
-            # We return the empty result as normal - the user can decide if they need help
+                    # Add optional filters if provided (empty lists are treated as no filter)
+                    if entity_types:
+                        search_query.entity_types = [SearchItemType(t) for t in entity_types]
+                    if note_types:
+                        search_query.note_types = note_types
+                    if after_date:
+                        search_query.after_date = after_date
+                    if metadata_filters:
+                        # Alias common column/model names to their frontmatter key equivalents.
+                        # Users often pass "note_type" (the entity model column) when the
+                        # frontmatter field is actually "type".
+                        _METADATA_KEY_ALIASES = {"note_type": "type"}
+                        metadata_filters = {
+                            _METADATA_KEY_ALIASES.get(k, k): v for k, v in metadata_filters.items()
+                        }
+                        search_query.metadata_filters = metadata_filters
+                    if tags:
+                        search_query.tags = tags
+                    if status:
+                        search_query.status = status
+                    if min_similarity is not None:
+                        search_query.min_similarity = min_similarity
 
-        return result
+                    # Reject searches with no criteria at all
+                    if search_query.no_criteria():
+                        return (
+                            "# No Search Criteria\n\n"
+                            "Please provide at least one of: `query`, `metadata_filters`, "
+                            "`tags`, `status`, `note_types`, `entity_types`, or `after_date`."
+                        )
 
-    except Exception as e:
-        logger.error(f"Search failed for query '{query}': {e}, project: {active_project.name}")
-        # Return formatted error message as string for better user experience
-        return _format_search_error_response(active_project.name, str(e), query, search_type)
+                    # Default to entity-level results to avoid returning individual
+                    # observations/relations as separate search results (see issue #31).
+                    # Applied after no_criteria() so that the implicit default doesn't
+                    # mask a truly empty search request.
+                    if not search_query.entity_types:
+                        search_query.entity_types = [SearchItemType("entity")]
+
+                    logger.debug(
+                        f"Search request: project={active_project.name} "
+                        f"search_type={effective_search_type} "
+                        f"query={effective_query or '<filters-only>'} "
+                        f"note_types={len(note_types)} entity_types={len(search_query.entity_types or [])} "
+                        f"page={page} page_size={page_size}"
+                    )
+                    # Import here to avoid circular import (tools → clients → utils → tools)
+                    from basic_memory.mcp.clients import SearchClient
+
+                    # Use typed SearchClient for API calls
+                    search_client = SearchClient(client, active_project.external_id)
+                    result = await search_client.search(
+                        search_query.model_dump(),
+                        page=page,
+                        page_size=page_size,
+                    )
+                    logger.debug(
+                        f"Search response: project={active_project.name} "
+                        f"results={len(result.results)} has_more={str(result.has_more).lower()} "
+                        f"page={result.current_page} page_size={result.page_size}"
+                    )
+
+                    # Check if we got no results and provide helpful guidance
+                    if not result.results:
+                        logger.debug(
+                            f"Search returned no results for query: {query} in project {active_project.name}"
+                        )
+                        # Don't treat this as an error, but the user might want guidance
+                        # We return the empty result as normal - the user can decide if they need help
+
+                    if output_format == "json":
+                        return result.model_dump(mode="json", exclude_none=True)
+
+                    return _format_search_markdown(result, active_project.name, query)
+
+                except Exception as e:
+                    logger.error(
+                        f"Search failed for query '{query or ''}': {e}, project: {active_project.name}"
+                    )
+                    # Return formatted error message as string for better user experience
+                    return _format_search_error_response(
+                        active_project.name, str(e), query or "", effective_search_type
+                    )

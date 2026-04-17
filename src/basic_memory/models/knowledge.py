@@ -1,10 +1,13 @@
 """Knowledge graph models."""
 
+import uuid
 from datetime import datetime
 from basic_memory.utils import ensure_timezone_aware
 from typing import Optional
 
 from sqlalchemy import (
+    BigInteger,
+    CheckConstraint,
     Integer,
     String,
     Text,
@@ -13,6 +16,7 @@ from sqlalchemy import (
     DateTime,
     Index,
     JSON,
+    Float,
     text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
@@ -35,8 +39,9 @@ class Entity(Base):
     __tablename__ = "entity"
     __table_args__ = (
         # Regular indexes
-        Index("ix_entity_type", "entity_type"),
+        Index("ix_note_type", "note_type"),
         Index("ix_entity_title", "title"),
+        Index("ix_entity_external_id", "external_id", unique=True),
         Index("ix_entity_created_at", "created_at"),  # For timeline queries
         Index("ix_entity_updated_at", "updated_at"),  # For timeline queries
         Index("ix_entity_project_id", "project_id"),  # For project filtering
@@ -57,9 +62,11 @@ class Entity(Base):
     )
 
     # Core identity
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)  # pyright: ignore [reportIncompatibleVariableOverride]
+    # External UUID for API references - stable identifier that won't change
+    external_id: Mapped[str] = mapped_column(String, unique=True, default=lambda: str(uuid.uuid4()))
     title: Mapped[str] = mapped_column(String)
-    entity_type: Mapped[str] = mapped_column(String)
+    note_type: Mapped[str] = mapped_column(String)
     entity_metadata: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     content_type: Mapped[str] = mapped_column(String)
 
@@ -73,6 +80,12 @@ class Entity(Base):
     # checksum of file
     checksum: Mapped[Optional[str]] = mapped_column(String, nullable=True)
 
+    # File metadata for sync
+    # mtime: file modification timestamp (Unix epoch float) for change detection
+    mtime: Mapped[Optional[float]] = mapped_column(Float, nullable=True)
+    # size: file size in bytes for quick change detection
+    size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     # Metadata and tracking
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now().astimezone()
@@ -82,6 +95,11 @@ class Entity(Base):
         default=lambda: datetime.now().astimezone(),
         onupdate=lambda: datetime.now().astimezone(),
     )
+
+    # Who created this entity (cloud user_profile_id UUID, null for local/CLI usage)
+    created_by: Mapped[Optional[str]] = mapped_column(String, nullable=True, default=None)
+    # Who last modified this entity (cloud user_profile_id UUID, null for local/CLI usage)
+    last_updated_by: Mapped[Optional[str]] = mapped_column(String, nullable=True, default=None)
 
     # Relationships
     project = relationship("Project", back_populates="entities")
@@ -99,6 +117,12 @@ class Entity(Base):
         back_populates="to_entity",
         foreign_keys="[Relation.to_id]",
         cascade="all, delete-orphan",
+    )
+    note_content = relationship(
+        "NoteContent",
+        back_populates="entity",
+        cascade="all, delete-orphan",
+        uselist=False,
     )
 
     @property
@@ -122,7 +146,75 @@ class Entity(Base):
         return value
 
     def __repr__(self) -> str:
-        return f"Entity(id={self.id}, name='{self.title}', type='{self.entity_type}'"
+        return f"Entity(id={self.id}, external_id='{self.external_id}', name='{self.title}', type='{self.note_type}', checksum='{self.checksum}')"
+
+
+class NoteContent(Base):
+    """Materialized markdown content and sync state for a note entity."""
+
+    __tablename__ = "note_content"
+    __table_args__ = (
+        CheckConstraint(
+            "file_write_status IN ("
+            "'pending', "
+            "'writing', "
+            "'synced', "
+            "'failed', "
+            "'external_change_detected'"
+            ")",
+            name="ck_note_content_file_write_status",
+        ),
+        Index("ix_note_content_project_id", "project_id"),
+        Index("ix_note_content_file_path", "file_path"),
+        Index("ix_note_content_external_id", "external_id", unique=True),
+    )
+
+    # Core identity mirrored from entity for hot note reads
+    entity_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("entity.id", ondelete="CASCADE"),
+        primary_key=True,
+    )
+    project_id: Mapped[int] = mapped_column(
+        Integer,
+        ForeignKey("project.id", ondelete="CASCADE"),
+        nullable=False,
+    )
+    external_id: Mapped[str] = mapped_column(String, nullable=False)
+    file_path: Mapped[str] = mapped_column(String, nullable=False)
+
+    # Materialized content version tracked in the tenant database
+    markdown_content: Mapped[str] = mapped_column(Text, nullable=False)
+    db_version: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    db_checksum: Mapped[str] = mapped_column(String, nullable=False)
+
+    # File materialization state tracked against the latest write attempts
+    file_version: Mapped[Optional[int]] = mapped_column(BigInteger, nullable=True)
+    file_checksum: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    file_write_status: Mapped[str] = mapped_column(String, nullable=False, default="pending")
+    last_source: Mapped[Optional[str]] = mapped_column(String, nullable=True)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now().astimezone(),
+        onupdate=lambda: datetime.now().astimezone(),
+    )
+    file_updated_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+    last_materialization_error: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    last_materialization_attempt_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+    )
+
+    entity = relationship("Entity", back_populates="note_content")
+
+    def __repr__(self) -> str:  # pragma: no cover
+        return (
+            f"NoteContent(entity_id={self.entity_id}, external_id='{self.external_id}', "
+            f"file_path='{self.file_path}', file_write_status='{self.file_write_status}')"
+        )
 
 
 class Observation(Base):
@@ -137,7 +229,8 @@ class Observation(Base):
         Index("ix_observation_category", "category"),  # Add category index
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)  # pyright: ignore [reportIncompatibleVariableOverride]
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("project.id"), index=True)
     entity_id: Mapped[int] = mapped_column(Integer, ForeignKey("entity.id", ondelete="CASCADE"))
     content: Mapped[str] = mapped_column(Text)
     category: Mapped[str] = mapped_column(String, nullable=False, default="note")
@@ -155,9 +248,14 @@ class Observation(Base):
 
         We can construct these because observations are always defined in
         and owned by a single entity.
+
+        Content is truncated to 200 chars to stay under PostgreSQL's
+        btree index limit of 2704 bytes.
         """
+        # Truncate content to avoid exceeding PostgreSQL's btree index limit
+        content_for_permalink = self.content[:200] if len(self.content) > 200 else self.content
         return generate_permalink(
-            f"{self.entity.permalink}/observations/{self.category}/{self.content}"
+            f"{self.entity.permalink}/observations/{self.category}/{content_for_permalink}"
         )
 
     def __repr__(self) -> str:  # pragma: no cover
@@ -178,7 +276,8 @@ class Relation(Base):
         Index("ix_relation_to_id", "to_id"),
     )
 
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)  # pyright: ignore [reportIncompatibleVariableOverride]
+    project_id: Mapped[int] = mapped_column(Integer, ForeignKey("project.id"), index=True)
     from_id: Mapped[int] = mapped_column(Integer, ForeignKey("entity.id", ondelete="CASCADE"))
     to_id: Mapped[Optional[int]] = mapped_column(
         Integer, ForeignKey("entity.id", ondelete="CASCADE"), nullable=True

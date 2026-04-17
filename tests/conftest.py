@@ -1,18 +1,34 @@
 """Common test fixtures."""
 
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from textwrap import dedent
 from typing import AsyncGenerator
 
-import os
 import pytest
 import pytest_asyncio
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from alembic import command
+from alembic.config import Config
+from sqlalchemy import text
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import NullPool
+from testcontainers.postgres import PostgresContainer
 
 from basic_memory import db
-from basic_memory.config import ProjectConfig, BasicMemoryConfig, ConfigManager
+from basic_memory.config import (
+    ProjectConfig,
+    ProjectEntry,
+    BasicMemoryConfig,
+    ConfigManager,
+    DatabaseBackend,
+)
 from basic_memory.db import DatabaseType
 from basic_memory.markdown import EntityParser
 from basic_memory.markdown.markdown_processor import MarkdownProcessor
@@ -23,7 +39,6 @@ from basic_memory.repository.entity_repository import EntityRepository
 from basic_memory.repository.observation_repository import ObservationRepository
 from basic_memory.repository.project_repository import ProjectRepository
 from basic_memory.repository.relation_repository import RelationRepository
-from basic_memory.repository.search_repository import SearchRepository
 from basic_memory.schemas.base import Entity as EntitySchema
 from basic_memory.services import (
     EntityService,
@@ -37,9 +52,182 @@ from basic_memory.sync.sync_service import SyncService
 from basic_memory.sync.watch_service import WatchService
 
 
+# =============================================================================
+# Database Backend Selection (env var approach)
+# =============================================================================
+# By default, tests run against SQLite.
+# Set BASIC_MEMORY_TEST_POSTGRES=1 to run against Postgres (uses testcontainers).
+# This allows running sqlite/postgres tests in parallel in CI.
+
+
+@pytest.fixture(scope="session")
+def db_backend():
+    """Determine database backend from environment variable.
+
+    Default: sqlite
+    Set BASIC_MEMORY_TEST_POSTGRES=1 to use postgres
+    """
+    if os.environ.get("BASIC_MEMORY_TEST_POSTGRES", "").lower() in ("1", "true", "yes"):
+        return "postgres"
+    return "sqlite"
+
+
+@pytest.fixture(scope="session")
+def postgres_container(db_backend):
+    """Session-scoped Postgres container for tests.
+
+    Uses testcontainers to spin up a real Postgres instance in Docker.
+    The container is started once per test session and shared across all tests.
+    Only starts if db_backend is "postgres".
+    """
+    if db_backend != "postgres" or _configured_postgres_sync_url():
+        yield None
+        return
+
+    # Use pgvector image so CREATE EXTENSION vector succeeds in search repository
+    with PostgresContainer("pgvector/pgvector:pg16") as postgres:
+        yield postgres
+
+
+POSTGRES_EPHEMERAL_TABLES = [
+    "search_vector_embeddings",
+    "search_vector_index",
+]
+
+
+def _configured_postgres_sync_url() -> str | None:
+    """Prefer an externally managed Postgres server when CI provides one."""
+    configured_url = os.environ.get("BASIC_MEMORY_TEST_POSTGRES_URL") or os.environ.get(
+        "POSTGRES_TEST_URL"
+    )
+    if not configured_url:
+        return None
+
+    return (
+        configured_url.replace("postgresql+asyncpg://", "postgresql+psycopg2://", 1)
+        .replace("postgresql://", "postgresql+psycopg2://", 1)
+        .replace("postgres://", "postgresql+psycopg2://", 1)
+    )
+
+
+def _postgres_alembic_config(async_url: str) -> Config:
+    """Build Alembic config for stamping the shared Postgres test schema."""
+    alembic_dir = Path(db.__file__).parent / "alembic"
+    cfg = Config()
+    cfg.set_main_option("script_location", str(alembic_dir))
+    cfg.set_main_option(
+        "file_template",
+        "%%(year)d_%%(month).2d_%%(day).2d_%%(hour).2d%%(minute).2d-%%(rev)s_%%(slug)s",
+    )
+    cfg.set_main_option("timezone", "UTC")
+    cfg.set_main_option("revision_environment", "false")
+    cfg.set_main_option("sqlalchemy.url", async_url)
+    return cfg
+
+
+def _postgres_reset_tables() -> list[str]:
+    """Resolve the current ORM table set at reset time.
+
+    Some tests declare models after conftest import, so the list must stay dynamic.
+    """
+    return [table.name for table in Base.metadata.sorted_tables] + [
+        "search_index",
+        "search_vector_chunks",
+    ]
+
+
+def _resolve_postgres_sync_url(postgres_container) -> str:
+    """Use CI's shared service when configured, otherwise fall back to testcontainers."""
+    configured_url = _configured_postgres_sync_url()
+    if configured_url:
+        return configured_url
+    assert postgres_container is not None
+    return postgres_container.get_connection_url()
+
+
+async def _reset_postgres_test_schema(engine: AsyncEngine, async_url: str) -> None:
+    """Restore the shared Postgres schema to a clean baseline."""
+    from basic_memory.models.search import (
+        CREATE_POSTGRES_SEARCH_INDEX_FTS,
+        CREATE_POSTGRES_SEARCH_INDEX_METADATA,
+        CREATE_POSTGRES_SEARCH_INDEX_PERMALINK,
+        CREATE_POSTGRES_SEARCH_INDEX_TABLE,
+        CREATE_POSTGRES_SEARCH_VECTOR_CHUNKS_INDEX,
+        CREATE_POSTGRES_SEARCH_VECTOR_CHUNKS_TABLE,
+    )
+
+    async with engine.begin() as conn:
+        # Trigger: several tests intentionally drop or stub search tables to exercise recovery code.
+        # Why: TRUNCATE is much cheaper than drop_all/create_all, but it only works when the schema exists.
+        # Outcome: we recreate any missing core tables once, then clear rows for deterministic test setup.
+        await conn.run_sync(Base.metadata.create_all)
+        await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_TABLE)
+        await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_FTS)
+        await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_METADATA)
+        await conn.execute(CREATE_POSTGRES_SEARCH_INDEX_PERMALINK)
+        await conn.execute(CREATE_POSTGRES_SEARCH_VECTOR_CHUNKS_TABLE)
+        await conn.execute(CREATE_POSTGRES_SEARCH_VECTOR_CHUNKS_INDEX)
+
+        for table_name in POSTGRES_EPHEMERAL_TABLES:
+            await conn.execute(text(f"DROP TABLE IF EXISTS {table_name} CASCADE"))
+
+        await conn.execute(
+            text(f"TRUNCATE TABLE {', '.join(_postgres_reset_tables())} RESTART IDENTITY CASCADE")
+        )
+
+        alembic_version_exists = (
+            await conn.execute(text("SELECT to_regclass('public.alembic_version')"))
+        ).scalar() is not None
+
+    if not alembic_version_exists:
+        command.stamp(_postgres_alembic_config(async_url), "head")
+
+
+@pytest_asyncio.fixture(scope="session", loop_scope="session")
+async def postgres_engine(
+    db_backend, postgres_container
+) -> AsyncGenerator[AsyncEngine | None, None]:
+    """Create the shared Postgres engine once per test session."""
+    if db_backend != "postgres":
+        yield None
+        return
+
+    sync_url = _resolve_postgres_sync_url(postgres_container)
+    async_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
+    engine = create_async_engine(
+        async_url,
+        echo=False,
+        poolclass=NullPool,
+    )
+
+    try:
+        yield engine
+    finally:
+        await engine.dispose()
+
+
 @pytest.fixture
 def anyio_backend():
     return "asyncio"
+
+
+@pytest.fixture(autouse=True)
+def suppress_logfire_no_config_warning(monkeypatch) -> None:
+    """Keep tests focused on behavior instead of Logfire bootstrap warnings."""
+    monkeypatch.setenv("LOGFIRE_IGNORE_NO_CONFIG", "1")
+
+
+@pytest_asyncio.fixture(autouse=True)
+async def cleanup_global_db_after_test() -> AsyncGenerator[None, None]:
+    """Close any module-level DB engine created outside fixture ownership."""
+    yield
+
+    # Trigger: a test exercises production fallback routing instead of the
+    # per-test engine fixture.
+    # Why: that path stores an engine in basic_memory.db module state, and
+    # a later fixture can overwrite the reference before it is disposed.
+    # Outcome: close straggler aiosqlite worker threads before the loop closes.
+    await db.shutdown_db()
 
 
 @pytest.fixture
@@ -59,25 +247,44 @@ def config_home(tmp_path, monkeypatch) -> Path:
     return tmp_path
 
 
-@pytest.fixture(scope="function", autouse=True)
-def app_config(config_home, tmp_path, monkeypatch) -> BasicMemoryConfig:
-    """Create test app configuration."""
-    # Create a basic config without depending on test_project to avoid circular dependency
-    projects = {"test-project": str(config_home)}
+@pytest.fixture(scope="function")
+def app_config(config_home, db_backend, postgres_container, monkeypatch) -> BasicMemoryConfig:
+    """Create test app configuration for the appropriate backend."""
+    projects = {"test-project": ProjectEntry(path=str(config_home))}
+
+    # Set backend based on parameterized db_backend fixture
+    if db_backend == "postgres":
+        backend = DatabaseBackend.POSTGRES
+        # Trigger: CI jobs can provide a shared Postgres service instead of per-session containers.
+        # Why: reusing one pgvector-enabled server avoids Docker startup churn on every job.
+        # Outcome: local runs keep using testcontainers, while CI injects a stable service URL.
+        sync_url = _resolve_postgres_sync_url(postgres_container)
+        database_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
+    else:
+        backend = DatabaseBackend.SQLITE
+        database_url = None
+
     app_config = BasicMemoryConfig(
         env="test",
         projects=projects,
         default_project="test-project",
         update_permalinks_on_move=True,
+        database_backend=backend,
+        database_url=database_url,
     )
 
     return app_config
 
 
-@pytest.fixture(autouse=True)
-def config_manager(
-    app_config: BasicMemoryConfig, project_config: ProjectConfig, config_home: Path, monkeypatch
-) -> ConfigManager:
+@pytest.fixture
+def config_manager(app_config: BasicMemoryConfig, config_home: Path, monkeypatch) -> ConfigManager:
+    # Invalidate config cache to ensure clean state for each test
+    from basic_memory import config as config_module
+
+    config_module._CONFIG_CACHE = None
+    config_module._CONFIG_MTIME = None
+    config_module._CONFIG_SIZE = None
+
     # Create a new ConfigManager that uses the test home directory
     config_manager = ConfigManager()
     # Update its paths to use the test directory
@@ -90,7 +297,7 @@ def config_manager(
     return config_manager
 
 
-@pytest.fixture(scope="function", autouse=True)
+@pytest.fixture(scope="function")
 def project_config(test_project):
     """Create test project configuration."""
 
@@ -119,16 +326,73 @@ def test_config(config_home, project_config, app_config, config_manager) -> Test
 @pytest_asyncio.fixture(scope="function")
 async def engine_factory(
     app_config,
+    config_manager,
+    db_backend,
+    postgres_container,
+    postgres_engine,
 ) -> AsyncGenerator[tuple[AsyncEngine, async_sessionmaker[AsyncSession]], None]:
-    """Create an engine and session factory using an in-memory SQLite database."""
-    async with db.engine_session_factory(
-        db_path=app_config.database_path, db_type=DatabaseType.MEMORY
-    ) as (engine, session_maker):
-        # Create all tables for the DB the engine is connected to
-        async with engine.begin() as conn:
-            await conn.run_sync(Base.metadata.create_all)
+    """Engine factory for SQLite or Postgres tests.
 
-        yield engine, session_maker
+    Uses parameterized db_backend fixture to run tests against both backends.
+    """
+    from basic_memory.models.search import (
+        CREATE_SEARCH_INDEX,
+        CREATE_SQLITE_SEARCH_VECTOR_CHUNKS,
+        CREATE_SQLITE_SEARCH_VECTOR_CHUNKS_PROJECT_ENTITY,
+        CREATE_SQLITE_SEARCH_VECTOR_CHUNKS_UNIQUE,
+    )
+
+    if db_backend == "postgres":
+        assert postgres_engine is not None
+        sync_url = _resolve_postgres_sync_url(postgres_container)
+        async_url = sync_url.replace("postgresql+psycopg2", "postgresql+asyncpg")
+
+        # Trigger: Basic Memory sync/indexing paths can catch database errors,
+        # roll back, and continue through new scoped sessions.
+        # Why: binding every scoped session to one savepoint-backed connection can
+        # leave that connection in PendingRollbackError state for later sessions.
+        # Outcome: keep the session-scoped engine, but use normal Postgres
+        # transaction semantics and reset rows/schema between tests.
+        await _reset_postgres_test_schema(postgres_engine, async_url)
+
+        session_maker = async_sessionmaker(
+            bind=postgres_engine,
+            class_=AsyncSession,
+            expire_on_commit=False,
+            autoflush=False,
+        )
+
+        # Important: wire the engine/session into the global db module state.
+        # Some codepaths (e.g. app initialization / MCP lifespan) call db.get_or_create_db(),
+        # which would otherwise create a separate engine and run migrations, conflicting with
+        # our test-created schema (and causing DuplicateTableError).
+        db._engine = postgres_engine
+        db._session_maker = session_maker
+
+        try:
+            yield postgres_engine, session_maker
+        finally:
+            if db._engine is postgres_engine:
+                db._engine = None
+            if db._session_maker is session_maker:
+                db._session_maker = None
+    else:
+        # SQLite mode
+        db_type = DatabaseType.MEMORY
+        async with db.engine_session_factory(db_path=app_config.database_path, db_type=db_type) as (
+            engine,
+            session_maker,
+        ):
+            # Create all tables via ORM, then add search_index via FTS5 DDL
+            async with engine.begin() as conn:
+                await conn.run_sync(Base.metadata.create_all)
+                await conn.execute(CREATE_SEARCH_INDEX)
+                await conn.execute(CREATE_SQLITE_SEARCH_VECTOR_CHUNKS)
+                await conn.execute(CREATE_SQLITE_SEARCH_VECTOR_CHUNKS_PROJECT_ENTITY)
+                await conn.execute(CREATE_SQLITE_SEARCH_VECTOR_CHUNKS_UNIQUE)
+
+            # Yield after setup is complete
+            yield engine, session_maker
 
 
 @pytest_asyncio.fixture
@@ -200,6 +464,7 @@ async def entity_service(
     entity_parser: EntityParser,
     file_service: FileService,
     link_resolver: LinkResolver,
+    app_config: BasicMemoryConfig,
 ) -> EntityService:
     """Create EntityService."""
     return EntityService(
@@ -209,6 +474,7 @@ async def entity_service(
         relation_repository=relation_repository,
         file_service=file_service,
         link_resolver=link_resolver,
+        app_config=app_config,
     )
 
 
@@ -243,6 +509,7 @@ async def sync_service(
     app_config: BasicMemoryConfig,
     entity_service: EntityService,
     entity_parser: EntityParser,
+    project_repository: ProjectRepository,
     entity_repository: EntityRepository,
     relation_repository: RelationRepository,
     search_service: SearchService,
@@ -252,6 +519,7 @@ async def sync_service(
     return SyncService(
         app_config=app_config,
         entity_service=entity_service,
+        project_repository=project_repository,
         entity_repository=entity_repository,
         relation_repository=relation_repository,
         entity_parser=entity_parser,
@@ -269,19 +537,28 @@ async def directory_service(entity_repository, project_config) -> DirectoryServi
 
 
 @pytest_asyncio.fixture
-async def search_repository(session_maker, test_project: Project):
-    """Create SearchRepository instance with project context"""
-    return SearchRepository(session_maker, project_id=test_project.id)
+async def search_repository(session_maker, test_project: Project, app_config: BasicMemoryConfig):
+    """Create backend-appropriate SearchRepository instance with project context"""
+    from basic_memory.repository.sqlite_search_repository import SQLiteSearchRepository
+    from basic_memory.repository.postgres_search_repository import PostgresSearchRepository
 
-
-@pytest_asyncio.fixture(autouse=True)
-async def init_search_index(search_service):
-    await search_service.init_search_index()
+    if app_config.database_backend == DatabaseBackend.POSTGRES:
+        return PostgresSearchRepository(
+            session_maker,
+            project_id=test_project.id,
+            app_config=app_config,
+        )
+    else:
+        return SQLiteSearchRepository(
+            session_maker,
+            project_id=test_project.id,
+            app_config=app_config,
+        )
 
 
 @pytest_asyncio.fixture
 async def search_service(
-    search_repository: SearchRepository,
+    search_repository,
     entity_repository: EntityRepository,
     file_service: FileService,
 ) -> SearchService:
@@ -297,7 +574,7 @@ async def sample_entity(entity_repository: EntityRepository) -> Entity:
     entity_data = {
         "project_id": entity_repository.project_id,
         "title": "Test Entity",
-        "entity_type": "test",
+        "note_type": "test",
         "permalink": "test/test-entity",
         "file_path": "test/test_entity.md",
         "content_type": "text/markdown",
@@ -310,9 +587,10 @@ async def sample_entity(entity_repository: EntityRepository) -> Entity:
 @pytest_asyncio.fixture
 async def project_service(
     project_repository: ProjectRepository,
+    file_service: FileService,
 ) -> ProjectService:
-    """Create ProjectService with repository."""
-    return ProjectService(repository=project_repository)
+    """Create ProjectService with repository and file service for directory operations."""
+    return ProjectService(repository=project_repository, file_service=file_service)
 
 
 @pytest_asyncio.fixture
@@ -323,8 +601,8 @@ async def full_entity(sample_entity, entity_repository, file_service, entity_ser
     entity, created = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Search_Entity",
-            folder="test",
-            entity_type="test",
+            directory="test",
+            note_type="test",
             content=dedent("""
                 ## Observations
                 - [tech] Tech note
@@ -354,8 +632,8 @@ async def test_graph(
     deeper, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Deeper Entity",
-            entity_type="deeper",
-            folder="test",
+            note_type="deeper",
+            directory="test",
             content=dedent("""
                 # Deeper Entity
                 """),
@@ -365,8 +643,8 @@ async def test_graph(
     deep, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Deep Entity",
-            entity_type="deep",
-            folder="test",
+            note_type="deep",
+            directory="test",
             content=dedent("""
                 # Deep Entity
                 - deeper_connection [[Deeper Entity]]
@@ -377,8 +655,8 @@ async def test_graph(
     connected_2, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Connected Entity 2",
-            entity_type="test",
-            folder="test",
+            note_type="test",
+            directory="test",
             content=dedent("""
                 # Connected Entity 2
                 - deep_connection [[Deep Entity]]
@@ -389,8 +667,8 @@ async def test_graph(
     connected_1, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Connected Entity 1",
-            entity_type="test",
-            folder="test",
+            note_type="test",
+            directory="test",
             content=dedent("""
                 # Connected Entity 1
                 - [note] Connected 1 note
@@ -402,8 +680,8 @@ async def test_graph(
     root, _ = await entity_service.create_or_update_entity(
         EntitySchema(
             title="Root",
-            entity_type="test",
-            folder="test",
+            note_type="test",
+            directory="test",
             content=dedent("""
                 # Root Entity
                 - [note] Root note 1
@@ -432,8 +710,22 @@ async def test_graph(
 
 
 @pytest.fixture
-def watch_service(app_config: BasicMemoryConfig, project_repository) -> WatchService:
-    return WatchService(app_config=app_config, project_repository=project_repository)
+def watch_service(app_config: BasicMemoryConfig, project_repository, sync_service) -> WatchService:
+    """Create WatchService with injected sync_service factory.
+
+    The sync_service_factory allows tests to use the fixture-provided sync_service
+    instead of the production get_sync_service() which creates its own db connection.
+    """
+
+    async def sync_service_factory(project):
+        """Return the test fixture's sync_service regardless of project."""
+        return sync_service
+
+    return WatchService(
+        app_config=app_config,
+        project_repository=project_repository,
+        sync_service_factory=sync_service_factory,
+    )
 
 
 @pytest.fixture

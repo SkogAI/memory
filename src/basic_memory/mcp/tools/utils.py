@@ -5,6 +5,7 @@ to the Basic Memory API, with improved error handling and logging.
 """
 
 import typing
+from contextlib import contextmanager
 from typing import Optional
 
 from httpx import Response, URL, AsyncClient, HTTPStatusError
@@ -23,7 +24,60 @@ from httpx._types import (
 from loguru import logger
 from mcp.server.fastmcp.exceptions import ToolError
 
-from basic_memory.mcp.tools.headers import inject_auth_header
+from basic_memory import telemetry
+from basic_memory.config import ConfigManager
+
+
+def _classify_http_outcome(status_code: int) -> str:
+    """Map HTTP status codes to a low-cardinality outcome label."""
+    if 200 <= status_code < 300:
+        return "success"
+    if 300 <= status_code < 400:  # pragma: no cover
+        return "redirect"
+    if 400 <= status_code < 500:
+        return "client_error"
+    if 500 <= status_code < 600:
+        return "server_error"
+    return "unknown"  # pragma: no cover
+
+
+class _RequestSpan:
+    """Small adapter for attaching outcome metadata to a live request span."""
+
+    def __init__(self, active_span: typing.Any | None):
+        self._active_span = active_span
+
+    def record_response(self, response: Response) -> None:
+        self._set_attributes(
+            {
+                "status_code": response.status_code,
+                "is_success": response.is_success,
+                "outcome": _classify_http_outcome(response.status_code),
+            }
+        )
+
+    def record_transport_error(self, exc: Exception) -> None:
+        self._set_attributes(
+            {
+                "is_success": False,
+                "outcome": "transport_error",
+                "error_type": type(exc).__name__,
+            }
+        )
+
+    def _set_attributes(self, attrs: dict[str, typing.Any]) -> None:
+        if self._active_span is None:
+            return
+
+        set_attributes = getattr(self._active_span, "set_attributes", None)
+        if callable(set_attributes):
+            set_attributes(attrs)
+            return
+
+        set_attribute = getattr(self._active_span, "set_attribute", None)
+        if callable(set_attribute):
+            for key, value in attrs.items():
+                set_attribute(key, value)
 
 
 def get_error_message(
@@ -76,10 +130,97 @@ def get_error_message(
         return f"HTTP error {status_code}: {method} request to '{path}' failed"
 
 
+def _extract_response_data(response: Response) -> typing.Any:
+    """Safely decode response payload for error reporting."""
+    try:
+        return response.json()
+    except Exception:
+        return None
+
+
+def _response_detail_text(response_data: typing.Any) -> str | None:
+    """Extract textual error detail from API payloads."""
+    if isinstance(response_data, dict):
+        detail = response_data.get("detail")
+        if isinstance(detail, str):
+            return detail
+        if isinstance(detail, dict):
+            nested_message = detail.get("message")
+            if isinstance(nested_message, str):
+                return nested_message
+            return str(detail)
+        if detail is not None:
+            return str(detail)
+    return None
+
+
+def _has_configured_cloud_api_key() -> bool:
+    """Check whether a cloud API key is currently configured."""
+    try:
+        return bool(ConfigManager().config.cloud_api_key)
+    except Exception:
+        return False
+
+
+def _resolve_error_message(
+    status_code: int, url: URL | str, method: str, response_data: typing.Any
+) -> str:
+    """Resolve a user-facing error message with cloud auth remediation when relevant."""
+    detail_text = _response_detail_text(response_data)
+
+    if status_code == 401 and _has_configured_cloud_api_key():
+        detail_lower = detail_text.lower() if detail_text else ""
+        if (
+            "invalid jwt" in detail_lower
+            or "invalid token" in detail_lower
+            or "authentication required" in detail_lower
+            or not detail_lower
+        ):
+            return (
+                "Authentication failed: the configured cloud API key was rejected by the server. "
+                "Basic Memory prioritizes cloud_api_key over OAuth for cloud routing. "
+                "Fix by running `bm cloud api-key save <valid-key>` "
+                "or remove `cloud_api_key` and use `bm cloud login`."
+            )
+
+    if detail_text:
+        return detail_text
+
+    return get_error_message(status_code, url, method)
+
+
+@contextmanager
+def _request_scope(
+    method: str,
+    *,
+    client_name: str | None,
+    operation: str | None,
+    path_template: str | None,
+    params: QueryParamTypes | None = None,
+    has_body: bool = False,
+):
+    """Create the shared MCP transport span used by all HTTP helpers."""
+    attrs = {
+        "method": method,
+        "client_name": client_name,
+        "operation": operation,
+        "path_template": path_template,
+        "phase": "request",
+        "has_query": bool(params),
+        "has_body": has_body,
+    }
+    with telemetry.contextualize(**attrs):
+        with telemetry.started_span("mcp.http.request", **attrs) as active_span:
+            yield _RequestSpan(active_span)
+
+
 async def call_get(
     client: AsyncClient,
     url: URL | str,
     *,
+    client_name: str | None = None,
+    operation: str | None = None,
+    path_template: str | None = None,
     params: QueryParamTypes | None = None,
     headers: HeaderTypes | None = None,
     cookies: CookieTypes | None = None,
@@ -109,31 +250,35 @@ async def call_get(
     """
     logger.debug(f"Calling GET '{url}' params: '{params}'")
     error_message = None
+    request_span: _RequestSpan | None = None
 
-    headers = inject_auth_header(headers)
     try:
-        response = await client.get(
-            url,
+        with _request_scope(
+            "GET",
+            client_name=client_name,
+            operation=operation,
+            path_template=path_template,
             params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
+        ) as request_span:
+            response = await client.get(
+                url,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                extensions=extensions,
+            )
+            request_span.record_response(response)
 
         if response.is_success:
             return response
 
         # Handle different status codes differently
         status_code = response.status_code
-        # get the message if available
-        response_data = response.json()
-        if isinstance(response_data, dict) and "detail" in response_data:
-            error_message = response_data["detail"]
-        else:
-            error_message = get_error_message(status_code, url, "PUT")
+        response_data = _extract_response_data(response)
+        error_message = _resolve_error_message(status_code, url, "GET", response_data)
 
         # Log at appropriate level based on status code
         if 400 <= status_code < 500:
@@ -152,12 +297,19 @@ async def call_get(
 
     except HTTPStatusError as e:
         raise ToolError(error_message) from e
+    except Exception as e:
+        if request_span is not None:
+            request_span.record_transport_error(e)
+        raise
 
 
 async def call_put(
     client: AsyncClient,
     url: URL | str,
     *,
+    client_name: str | None = None,
+    operation: str | None = None,
+    path_template: str | None = None,
     content: RequestContent | None = None,
     data: RequestData | None = None,
     files: RequestFiles | None = None,
@@ -195,25 +347,32 @@ async def call_put(
     """
     logger.debug(f"Calling PUT '{url}'")
     error_message = None
-
-    # Inject JWT from FastMCP context if available
-    headers = inject_auth_header(headers)
+    request_span: _RequestSpan | None = None
 
     try:
-        response = await client.put(
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
+        with _request_scope(
+            "PUT",
+            client_name=client_name,
+            operation=operation,
+            path_template=path_template,
             params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
+            has_body=any(value is not None for value in (content, data, files, json)),
+        ) as request_span:
+            response = await client.put(
+                url,
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                extensions=extensions,
+            )
+            request_span.record_response(response)
 
         if response.is_success:
             return response
@@ -221,12 +380,8 @@ async def call_put(
         # Handle different status codes differently
         status_code = response.status_code
 
-        # get the message if available
-        response_data = response.json()
-        if isinstance(response_data, dict) and "detail" in response_data:
-            error_message = response_data["detail"]  # pragma: no cover
-        else:
-            error_message = get_error_message(status_code, url, "PUT")
+        response_data = _extract_response_data(response)
+        error_message = _resolve_error_message(status_code, url, "PUT", response_data)
 
         # Log at appropriate level based on status code
         if 400 <= status_code < 500:
@@ -245,12 +400,19 @@ async def call_put(
 
     except HTTPStatusError as e:
         raise ToolError(error_message) from e
+    except Exception as e:
+        if request_span is not None:
+            request_span.record_transport_error(e)
+        raise
 
 
 async def call_patch(
     client: AsyncClient,
     url: URL | str,
     *,
+    client_name: str | None = None,
+    operation: str | None = None,
+    path_template: str | None = None,
     content: RequestContent | None = None,
     data: RequestData | None = None,
     files: RequestFiles | None = None,
@@ -287,25 +449,32 @@ async def call_patch(
         ToolError: If the request fails with an appropriate error message
     """
     logger.debug(f"Calling PATCH '{url}'")
-
-    # Inject JWT from FastMCP context if available
-    headers = inject_auth_header(headers)
+    request_span: _RequestSpan | None = None
 
     try:
-        response = await client.patch(
-            url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
+        with _request_scope(
+            "PATCH",
+            client_name=client_name,
+            operation=operation,
+            path_template=path_template,
             params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
+            has_body=any(value is not None for value in (content, data, files, json)),
+        ) as request_span:
+            response = await client.patch(
+                url,
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                extensions=extensions,
+            )
+            request_span.record_response(response)
 
         if response.is_success:
             return response
@@ -313,15 +482,8 @@ async def call_patch(
         # Handle different status codes differently
         status_code = response.status_code
 
-        # Try to extract specific error message from response body
-        try:
-            response_data = response.json()
-            if isinstance(response_data, dict) and "detail" in response_data:
-                error_message = response_data["detail"]
-            else:
-                error_message = get_error_message(status_code, url, "PATCH")  # pragma: no cover
-        except Exception:  # pragma: no cover
-            error_message = get_error_message(status_code, url, "PATCH")  # pragma: no cover
+        response_data = _extract_response_data(response)
+        error_message = _resolve_error_message(status_code, url, "PATCH", response_data)
 
         # Log at appropriate level based on status code
         if 400 <= status_code < 500:
@@ -341,23 +503,23 @@ async def call_patch(
     except HTTPStatusError as e:
         status_code = e.response.status_code
 
-        # Try to extract specific error message from response body
-        try:
-            response_data = e.response.json()
-            if isinstance(response_data, dict) and "detail" in response_data:
-                error_message = response_data["detail"]
-            else:
-                error_message = get_error_message(status_code, url, "PATCH")  # pragma: no cover
-        except Exception:  # pragma: no cover
-            error_message = get_error_message(status_code, url, "PATCH")  # pragma: no cover
+        response_data = _extract_response_data(e.response)
+        error_message = _resolve_error_message(status_code, url, "PATCH", response_data)
 
         raise ToolError(error_message) from e
+    except Exception as e:
+        if request_span is not None:
+            request_span.record_transport_error(e)
+        raise
 
 
 async def call_post(
     client: AsyncClient,
     url: URL | str,
     *,
+    client_name: str | None = None,
+    operation: str | None = None,
+    path_template: str | None = None,
     content: RequestContent | None = None,
     data: RequestData | None = None,
     files: RequestFiles | None = None,
@@ -395,38 +557,41 @@ async def call_post(
     """
     logger.debug(f"Calling POST '{url}'")
     error_message = None
-
-    # Inject JWT from FastMCP context if available
-    headers = inject_auth_header(headers)
+    request_span: _RequestSpan | None = None
 
     try:
-        response = await client.post(
-            url=url,
-            content=content,
-            data=data,
-            files=files,
-            json=json,
+        with _request_scope(
+            "POST",
+            client_name=client_name,
+            operation=operation,
+            path_template=path_template,
             params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
-        logger.debug(f"response: {response.json()}")
+            has_body=any(value is not None for value in (content, data, files, json)),
+        ) as request_span:
+            response = await client.post(
+                url=url,
+                content=content,
+                data=data,
+                files=files,
+                json=json,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                extensions=extensions,
+            )
+            request_span.record_response(response)
+        logger.debug(f"response: {_extract_response_data(response)}")
 
         if response.is_success:
             return response
 
         # Handle different status codes differently
         status_code = response.status_code
-        # get the message if available
-        response_data = response.json()
-        if isinstance(response_data, dict) and "detail" in response_data:
-            error_message = response_data["detail"]
-        else:
-            error_message = get_error_message(status_code, url, "POST")
+        response_data = _extract_response_data(response)
+        error_message = _resolve_error_message(status_code, url, "POST", response_data)
 
         # Log at appropriate level based on status code
         if 400 <= status_code < 500:
@@ -445,12 +610,51 @@ async def call_post(
 
     except HTTPStatusError as e:
         raise ToolError(error_message) from e
+    except Exception as e:
+        if request_span is not None:
+            request_span.record_transport_error(e)
+        raise
+
+
+async def resolve_entity_id(client: AsyncClient, project_external_id: str, identifier: str) -> str:
+    """Resolve a string identifier to an entity external_id using the v2 API.
+
+    Args:
+        client: HTTP client for API calls
+        project_external_id: Project external ID (UUID)
+        identifier: The identifier to resolve (permalink, title, or path)
+
+    Returns:
+        The resolved entity external_id (UUID)
+
+    Raises:
+        ToolError: If the identifier cannot be resolved
+    """
+    try:
+        response = await call_post(
+            client,
+            f"/v2/projects/{project_external_id}/knowledge/resolve",
+            json={"identifier": identifier},
+        )
+        data = response.json()
+        return data["external_id"]
+    except HTTPStatusError as e:
+        if e.response.status_code == 404:  # pragma: no cover
+            raise ToolError(f"Entity not found: '{identifier}'")  # pragma: no cover
+        raise ToolError(f"Error resolving identifier '{identifier}': {e}")  # pragma: no cover
+    except Exception as e:
+        raise ToolError(
+            f"Unexpected error resolving identifier '{identifier}': {e}"
+        )  # pragma: no cover
 
 
 async def call_delete(
     client: AsyncClient,
     url: URL | str,
     *,
+    client_name: str | None = None,
+    operation: str | None = None,
+    path_template: str | None = None,
     params: QueryParamTypes | None = None,
     headers: HeaderTypes | None = None,
     cookies: CookieTypes | None = None,
@@ -480,33 +684,35 @@ async def call_delete(
     """
     logger.debug(f"Calling DELETE '{url}'")
     error_message = None
-
-    # Inject JWT from FastMCP context if available
-    headers = inject_auth_header(headers)
+    request_span: _RequestSpan | None = None
 
     try:
-        response = await client.delete(
-            url=url,
+        with _request_scope(
+            "DELETE",
+            client_name=client_name,
+            operation=operation,
+            path_template=path_template,
             params=params,
-            headers=headers,
-            cookies=cookies,
-            auth=auth,
-            follow_redirects=follow_redirects,
-            timeout=timeout,
-            extensions=extensions,
-        )
+        ) as request_span:
+            response = await client.delete(
+                url=url,
+                params=params,
+                headers=headers,
+                cookies=cookies,
+                auth=auth,
+                follow_redirects=follow_redirects,
+                timeout=timeout,
+                extensions=extensions,
+            )
+            request_span.record_response(response)
 
         if response.is_success:
             return response
 
         # Handle different status codes differently
         status_code = response.status_code
-        # get the message if available
-        response_data = response.json()
-        if isinstance(response_data, dict) and "detail" in response_data:
-            error_message = response_data["detail"]  # pragma: no cover
-        else:
-            error_message = get_error_message(status_code, url, "DELETE")
+        response_data = _extract_response_data(response)
+        error_message = _resolve_error_message(status_code, url, "DELETE", response_data)
 
         # Log at appropriate level based on status code
         if 400 <= status_code < 500:
@@ -525,73 +731,7 @@ async def call_delete(
 
     except HTTPStatusError as e:
         raise ToolError(error_message) from e
-
-
-def check_migration_status() -> Optional[str]:
-    """Check if sync/migration is in progress and return status message if so.
-
-    Returns:
-        Status message if sync is in progress, None if system is ready
-    """
-    try:
-        from basic_memory.services.sync_status_service import sync_status_tracker
-
-        if not sync_status_tracker.is_ready:
-            return sync_status_tracker.get_summary()
-        return None
-    except Exception:
-        # If there's any error checking sync status, assume ready
-        return None
-
-
-async def wait_for_migration_or_return_status(
-    timeout: float = 5.0, project_name: Optional[str] = None
-) -> Optional[str]:
-    """Wait briefly for sync/migration to complete, or return status message.
-
-    Args:
-        timeout: Maximum time to wait for sync completion
-        project_name: Optional project name to check specific project status.
-                     If provided, only checks that project's readiness.
-                     If None, uses global status check (legacy behavior).
-
-    Returns:
-        Status message if sync is still in progress, None if ready
-    """
-    try:
-        from basic_memory.services.sync_status_service import sync_status_tracker
-        import asyncio
-
-        # Check if we should use project-specific or global status
-        def is_ready() -> bool:
-            if project_name:
-                return sync_status_tracker.is_project_ready(project_name)
-            return sync_status_tracker.is_ready
-
-        if is_ready():
-            return None
-
-        # Wait briefly for sync to complete
-        start_time = asyncio.get_event_loop().time()
-        while (asyncio.get_event_loop().time() - start_time) < timeout:
-            if is_ready():
-                return None
-            await asyncio.sleep(0.1)  # Check every 100ms
-
-        # Still not ready after timeout
-        if project_name:
-            # For project-specific checks, get project status details
-            project_status = sync_status_tracker.get_project_status(project_name)
-            if project_status and project_status.status.value == "failed":
-                error_msg = project_status.error or "Unknown sync error"
-                return f"❌ Sync failed for project '{project_name}': {error_msg}"
-            elif project_status:
-                return f"🔄 Project '{project_name}' is still syncing: {project_status.message}"
-            else:
-                return f"⚠️ Project '{project_name}' status unknown"
-        else:
-            # Fall back to global summary for legacy calls
-            return sync_status_tracker.get_summary()
-    except Exception:  # pragma: no cover
-        # If there's any error, assume ready
-        return None
+    except Exception as e:
+        if request_span is not None:
+            request_span.record_transport_error(e)
+        raise

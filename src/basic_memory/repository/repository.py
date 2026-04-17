@@ -1,6 +1,7 @@
 """Base repository implementation."""
 
-from typing import Type, Optional, Any, Sequence, TypeVar, List, Dict
+from typing import Type, Optional, Any, Sequence, TypeVar, List, Dict, cast
+
 
 from loguru import logger
 from sqlalchemy import (
@@ -13,6 +14,7 @@ from sqlalchemy import (
     and_,
     delete,
 )
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import NoResultFound
 from sqlalchemy.ext.asyncio import async_sessionmaker, AsyncSession
 from sqlalchemy.orm.interfaces import LoaderOption
@@ -152,12 +154,25 @@ class Repository[T: Base]:
         # Add project filter if applicable
         return self._add_project_filter(query)
 
-    async def find_all(self, skip: int = 0, limit: Optional[int] = None) -> Sequence[T]:
-        """Fetch records from the database with pagination."""
+    async def find_all(
+        self, skip: int = 0, limit: Optional[int] = None, use_load_options: bool = True
+    ) -> Sequence[T]:
+        """Fetch records from the database with pagination.
+
+        Args:
+            skip: Number of records to skip
+            limit: Maximum number of records to return
+            use_load_options: Whether to apply eager loading options (default: True)
+        """
         logger.debug(f"Finding all {self.Model.__name__} (skip={skip}, limit={limit})")
 
         async with db.scoped_session(self.session_maker) as session:
-            query = select(self.Model).offset(skip).options(*self.get_load_options())
+            query = select(self.Model).offset(skip)
+
+            # Only apply load options if requested
+            if use_load_options:
+                query = query.options(*self.get_load_options())
+
             # Add project filter if applicable
             query = self._add_project_filter(query)
 
@@ -253,7 +268,7 @@ class Repository[T: Base]:
 
             return await self.select_by_ids(session, [model.id for model in model_list])  # pyright: ignore [reportAttributeAccessIssue]
 
-    async def update(self, entity_id: int, entity_data: dict | T) -> Optional[T]:
+    async def update(self, entity_id: int, entity_data: dict[str, Any] | T) -> Optional[T]:
         """Update an entity with the given data."""
         logger.debug(f"Updating {self.Model.__name__} {entity_id} with data: {entity_data}")
         async with db.scoped_session(self.session_maker) as session:
@@ -264,12 +279,13 @@ class Repository[T: Base]:
                 entity = result.scalars().one()
 
                 if isinstance(entity_data, dict):
-                    for key, value in entity_data.items():
-                        if key in self.valid_columns:
-                            setattr(entity, key, value)
+                    update_data = cast(dict[str, Any], entity_data)
+                    for key in self.valid_columns:
+                        if key in update_data:
+                            setattr(entity, key, update_data[key])
 
                 elif isinstance(entity_data, self.Model):
-                    for column in self.Model.__table__.columns.keys():
+                    for column in self.valid_columns:
                         setattr(entity, column, getattr(entity_data, column))
 
                 await session.flush()  # Make sure changes are flushed
@@ -310,7 +326,7 @@ class Repository[T: Base]:
                 conditions.append(getattr(self.Model, "project_id") == self.project_id)
 
             query = delete(self.Model).where(and_(*conditions))
-            result = await session.execute(query)
+            result = cast(CursorResult[Any], await session.execute(query))
             logger.debug(f"Deleted {result.rowcount} records")
             return result.rowcount
 
@@ -325,7 +341,7 @@ class Repository[T: Base]:
                 conditions.append(getattr(self.Model, "project_id") == self.project_id)
 
             query = delete(self.Model).where(and_(*conditions))
-            result = await session.execute(query)
+            result = cast(CursorResult[Any], await session.execute(query))
             deleted = result.rowcount > 0
             logger.debug(f"Deleted {result.rowcount} records")
             return deleted

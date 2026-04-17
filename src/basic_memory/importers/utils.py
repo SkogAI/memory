@@ -5,15 +5,18 @@ from datetime import datetime
 from typing import Any
 
 
-def clean_filename(name: str) -> str:  # pragma: no cover
+def clean_filename(name: str | None) -> str:  # pragma: no cover
     """Clean a string to be used as a filename.
 
     Args:
-        name: The string to clean.
+        name: The string to clean (can be None).
 
     Returns:
         A cleaned string suitable for use as a filename.
     """
+    # Handle None or empty input
+    if not name:
+        return "untitled"
     # Replace common punctuation and whitespace with underscores
     name = re.sub(r"[\s\-,.:/\\\[\]\(\)]+", "_", name)
     # Remove any non-alphanumeric or underscore characters
@@ -36,23 +39,24 @@ def format_timestamp(timestamp: Any) -> str:  # pragma: no cover
     Returns:
         A formatted string representation of the timestamp.
     """
+    parsed_timestamp = timestamp
     if isinstance(timestamp, str):
         try:
             # Try ISO format
-            timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
+            parsed_timestamp = datetime.fromisoformat(timestamp.replace("Z", "+00:00"))
         except ValueError:
             try:
                 # Try unix timestamp as string
-                timestamp = datetime.fromtimestamp(float(timestamp)).astimezone()
+                parsed_timestamp = datetime.fromtimestamp(float(timestamp)).astimezone()
             except ValueError:
                 # Return as is if we can't parse it
                 return timestamp
     elif isinstance(timestamp, (int, float)):
         # Unix timestamp
-        timestamp = datetime.fromtimestamp(timestamp).astimezone()
+        parsed_timestamp = datetime.fromtimestamp(timestamp).astimezone()
 
-    if isinstance(timestamp, datetime):
-        return timestamp.strftime("%Y-%m-%d %H:%M:%S")
+    if isinstance(parsed_timestamp, datetime):
+        return parsed_timestamp.strftime("%Y-%m-%d %H:%M:%S")
 
     # Return as is if we can't format it
-    return str(timestamp)  # pragma: no cover
+    return str(parsed_timestamp)  # pragma: no cover

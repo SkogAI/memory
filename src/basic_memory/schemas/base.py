@@ -21,11 +21,36 @@ from typing import List, Optional, Annotated, Dict
 from annotated_types import MinLen, MaxLen
 from dateparser import parse
 
-from pydantic import BaseModel, BeforeValidator, Field, model_validator
+from pydantic import BaseModel, BeforeValidator, Field, model_validator, computed_field
 
 from basic_memory.config import ConfigManager
-from basic_memory.file_utils import sanitize_for_filename, sanitize_for_folder
+from basic_memory.file_utils import sanitize_for_filename, sanitize_for_directory
 from basic_memory.utils import generate_permalink
+
+
+def has_valid_file_extension(filename: str) -> bool:
+    """Check if a filename has a valid file extension recognized by mimetypes.
+
+    This is used to determine whether to split the extension when processing
+    titles in kebab_filenames mode. Prevents treating periods in version numbers
+    or decimals as file extensions.
+
+    Args:
+        filename: The filename to check
+
+    Returns:
+        True if the filename has a recognized file extension, False otherwise
+
+    Examples:
+        >>> has_valid_file_extension("document.md")
+        True
+        >>> has_valid_file_extension("Version 2.0.0")
+        False
+        >>> has_valid_file_extension("image.png")
+        True
+    """
+    mime_type, _ = mimetypes.guess_type(filename)
+    return mime_type is not None
 
 
 def to_snake_case(name: str) -> str:
@@ -83,7 +108,7 @@ def parse_timeframe(timeframe: str) -> datetime:
         if parsed.tzinfo is None:
             parsed = parsed.astimezone()
         else:
-            parsed = parsed
+            parsed = parsed  # pragma: no cover
 
         # Enforce minimum 1-day lookback to handle timezone differences
         # This ensures we don't miss recent activity due to client/server timezone mismatches
@@ -113,12 +138,14 @@ def validate_timeframe(timeframe: str) -> str:
     # Convert to duration
     now = datetime.now().astimezone()
     if parsed > now:
-        raise ValueError("Timeframe cannot be in the future")
+        raise ValueError("Timeframe cannot be in the future")  # pragma: no cover
 
-    # Could format the duration back to our standard format
-    days = (now - parsed).days
+    # Round to nearest day to handle DST transitions where an hour shift
+    # can cause e.g. "7d" to compute as 6 days + 23 hours
+    total_seconds = (now - parsed).total_seconds()
+    days = round(total_seconds / 86400)
 
-    # Could enforce reasonable limits
+    # Enforce reasonable limits
     if days > 365:
         raise ValueError("Timeframe should be <= 1 year")
 
@@ -131,8 +158,8 @@ Permalink = Annotated[str, MinLen(1)]
 """Unique identifier in format '{path}/{normalized_name}'."""
 
 
-EntityType = Annotated[str, BeforeValidator(to_snake_case), MinLen(1), MaxLen(200)]
-"""Classification of entity (e.g., 'person', 'project', 'concept'). """
+NoteType = Annotated[str, BeforeValidator(to_snake_case), MinLen(1), MaxLen(200)]
+"""Classification of note (e.g., 'note', 'person', 'spec', 'schema'). """
 
 ALLOWED_CONTENT_TYPES = {
     "text/markdown",
@@ -151,14 +178,19 @@ ContentType = Annotated[
 ]
 
 
-RelationType = Annotated[str, MinLen(1), MaxLen(200)]
-"""Type of relationship between entities. Always use active voice present tense."""
+RelationType = Annotated[str, MinLen(1)]
+"""Type of relationship between entities. Always use active voice present tense.
+
+The database stores relation_type as an unrestricted string, and response models
+need to tolerate existing long-form values written by LLMs. Keeping an API-only
+200-character cap here causes reads to fail for valid stored data.
+"""
 
 ObservationStr = Annotated[
     str,
     BeforeValidator(str.strip),  # Clean whitespace
     MinLen(1),  # Ensure non-empty after stripping
-    MaxLen(1000),  # Keep reasonable length
+    # No MaxLen - matches DB Text column which has no length restriction
 ]
 
 
@@ -197,12 +229,13 @@ class Entity(BaseModel):
     """
 
     # private field to override permalink
+    # Use empty string "" as sentinel to indicate permalinks are explicitly disabled
     _permalink: Optional[str] = None
 
     title: str
     content: Optional[str] = None
-    folder: str
-    entity_type: EntityType = "note"
+    directory: str
+    note_type: NoteType = "note"
     entity_metadata: Optional[Dict] = Field(default=None, description="Optional metadata")
     content_type: ContentType = Field(
         description="MIME type of the content (e.g. text/markdown, image/jpeg)",
@@ -211,7 +244,7 @@ class Entity(BaseModel):
     )
 
     def __init__(self, **data):
-        data["folder"] = sanitize_for_folder(data.get("folder", ""))
+        data["directory"] = sanitize_for_directory(data.get("directory", ""))
         super().__init__(**data)
 
     @property
@@ -231,24 +264,34 @@ class Entity(BaseModel):
         use_kebab_case = app_config.kebab_filenames
 
         if use_kebab_case:
-            fixed_title = generate_permalink(file_path=fixed_title, split_extension=False)
+            # Convert to kebab-case: lowercase with hyphens, preserving periods in version numbers
+            # generate_permalink() uses mimetypes to detect real file extensions and only splits
+            # them off, avoiding misinterpreting periods in version numbers as extensions
+            has_extension = has_valid_file_extension(fixed_title)
+            fixed_title = generate_permalink(file_path=fixed_title, split_extension=has_extension)
 
         return fixed_title
 
+    @computed_field
     @property
-    def file_path(self):
+    def file_path(self) -> str:
         """Get the file path for this entity based on its permalink."""
         safe_title = self.safe_title
         if self.content_type == "text/markdown":
             return (
-                os.path.join(self.folder, f"{safe_title}.md") if self.folder else f"{safe_title}.md"
+                os.path.join(self.directory, f"{safe_title}.md")
+                if self.directory
+                else f"{safe_title}.md"
             )
         else:
-            return os.path.join(self.folder, safe_title) if self.folder else safe_title
+            return os.path.join(self.directory, safe_title) if self.directory else safe_title
 
     @property
-    def permalink(self) -> Permalink:
+    def permalink(self) -> Optional[Permalink]:
         """Get a url friendly path}."""
+        # Empty string is a sentinel value indicating permalinks are disabled
+        if self._permalink == "":
+            return None
         return self._permalink or generate_permalink(self.file_path)
 
     @model_validator(mode="after")

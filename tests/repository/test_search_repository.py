@@ -9,8 +9,14 @@ from sqlalchemy import text
 from basic_memory import db
 from basic_memory.models import Entity
 from basic_memory.models.project import Project
-from basic_memory.repository.search_repository import SearchRepository, SearchIndexRow
+from basic_memory.repository.search_repository import SearchIndexRow
+from basic_memory.repository.postgres_search_repository import PostgresSearchRepository
 from basic_memory.schemas.search import SearchItemType
+
+
+def is_postgres_backend(search_repository):
+    """Helper to check if search repository is Postgres-based."""
+    return isinstance(search_repository, PostgresSearchRepository)
 
 
 @pytest_asyncio.fixture
@@ -20,7 +26,7 @@ async def search_entity(session_maker, test_project: Project):
         entity = Entity(
             project_id=test_project.id,
             title="Search Test Entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/search-test-entity",
             file_path="test/search_test_entity.md",
             content_type="text/markdown",
@@ -46,9 +52,13 @@ async def second_project(project_repository):
 
 
 @pytest_asyncio.fixture
-async def second_project_repository(session_maker, second_project):
-    """Create a repository for the second project."""
-    return SearchRepository(session_maker, project_id=second_project.id)
+async def second_project_repository(session_maker, second_project, search_repository):
+    """Create a backend-appropriate repository for the second project.
+
+    Uses the same type as search_repository to ensure backend consistency.
+    """
+    # Use the same repository class as the main search_repository
+    return type(search_repository)(session_maker, project_id=second_project.id)
 
 
 @pytest_asyncio.fixture
@@ -58,7 +68,7 @@ async def second_entity(session_maker, second_project: Project):
         entity = Entity(
             project_id=second_project.id,
             title="Second Project Entity",
-            entity_type="test",
+            note_type="test",
             permalink="test/second-project-entity",
             file_path="test/second_project_entity.md",
             content_type="text/markdown",
@@ -71,16 +81,72 @@ async def second_entity(session_maker, second_project: Project):
 
 
 @pytest.mark.asyncio
-async def test_init_search_index(search_repository):
+async def test_init_search_index(search_repository, app_config):
     """Test that search index can be initialized."""
+    from basic_memory.config import DatabaseBackend
+
     await search_repository.init_search_index()
 
-    # Verify search_index table exists
+    # Verify search_index table exists (backend-specific query)
     async with db.scoped_session(search_repository.session_maker) as session:
-        result = await session.execute(
-            text("SELECT name FROM sqlite_master WHERE type='table' AND name='search_index';")
-        )
-        assert result.scalar() == "search_index"
+        if app_config.database_backend == DatabaseBackend.POSTGRES:
+            # For Postgres, query information_schema
+            result = await session.execute(
+                text(
+                    "SELECT table_name FROM information_schema.tables "
+                    "WHERE table_schema = 'public' AND table_name = 'search_index';"
+                )
+            )
+        else:
+            # For SQLite, query sqlite_master
+            result = await session.execute(
+                text("SELECT name FROM sqlite_master WHERE type='table' AND name='search_index';")
+            )
+
+        table_name = result.scalar()
+        assert table_name == "search_index"
+
+
+@pytest.mark.asyncio
+async def test_init_search_index_preserves_data(search_repository, search_entity):
+    """Regression test: calling init_search_index() twice should preserve indexed data.
+
+    This test prevents regression of the bug fixed in PR #503 where
+    init_search_index() was dropping existing data on every call due to
+    an unconditional DROP TABLE statement.
+
+    The bug caused search to work immediately after creating notes, but
+    return empty results after MCP server restarts (~30 minutes in Claude Desktop).
+    """
+    # Create and index a search item
+    search_row = SearchIndexRow(
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title=search_entity.title,
+        content_stems="regression test content for server restart",
+        content_snippet="This content should persist across init_search_index calls",
+        permalink=search_entity.permalink,
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"note_type": search_entity.note_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    await search_repository.index_item(search_row)
+
+    # Verify it's searchable
+    results = await search_repository.search(search_text="regression test")
+    assert len(results) == 1
+    assert results[0].title == search_entity.title
+
+    # Re-initialize the search index (simulates MCP server restart)
+    await search_repository.init_search_index()
+
+    # Verify data is still there after re-initialization
+    results_after = await search_repository.search(search_text="regression test")
+    assert len(results_after) == 1, "Search index data was lost after init_search_index()"
+    assert results_after[0].id == search_entity.id
 
 
 @pytest.mark.asyncio
@@ -96,7 +162,7 @@ async def test_index_item(search_repository, search_entity):
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -115,6 +181,116 @@ async def test_index_item(search_repository, search_entity):
 
 
 @pytest.mark.asyncio
+async def test_index_item_upsert_on_duplicate_permalink(search_repository, search_entity):
+    """Test that indexing the same permalink twice uses upsert instead of failing.
+
+    This tests the fix for the race condition where parallel entity indexing
+    could cause IntegrityError on the unique permalink constraint.
+    """
+    # First insert
+    search_row1 = SearchIndexRow(
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title="Original Title",
+        content_stems="original content",
+        content_snippet="Original content snippet",
+        permalink=search_entity.permalink,
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"note_type": search_entity.note_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    await search_repository.index_item(search_row1)
+
+    # Verify first insert worked
+    results = await search_repository.search(search_text="original")
+    assert len(results) == 1
+    assert results[0].title == "Original Title"
+
+    # Second insert with same permalink but different content (simulates race condition)
+    # This should NOT raise IntegrityError - it should upsert (update) instead
+    search_row2 = SearchIndexRow(
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title="Updated Title",
+        content_stems="updated content",
+        content_snippet="Updated content snippet",
+        permalink=search_entity.permalink,  # Same permalink!
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"note_type": search_entity.note_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    # This should succeed without raising IntegrityError
+    await search_repository.index_item(search_row2)
+
+    # Verify the row was updated, not duplicated
+    results_after = await search_repository.search(search_text="updated")
+    assert len(results_after) == 1
+    assert results_after[0].title == "Updated Title"
+
+    # Verify old content is gone (was replaced)
+    results_old = await search_repository.search(search_text="original")
+    assert len(results_old) == 0
+
+
+@pytest.mark.asyncio
+async def test_bulk_index_items_upsert_on_duplicate_permalink(search_repository, search_entity):
+    """Test that bulk_index_items uses upsert for duplicate permalinks.
+
+    This tests the fix for race conditions during bulk entity indexing.
+    """
+    # First bulk insert
+    search_row1 = SearchIndexRow(
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title="Bulk Original Title",
+        content_stems="bulk original content",
+        content_snippet="Bulk original content snippet",
+        permalink=search_entity.permalink,
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"note_type": search_entity.note_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    await search_repository.bulk_index_items([search_row1])
+
+    # Verify first insert worked
+    results = await search_repository.search(search_text="bulk original")
+    assert len(results) == 1
+    assert results[0].title == "Bulk Original Title"
+
+    # Second bulk insert with same permalink (simulates race condition)
+    search_row2 = SearchIndexRow(
+        id=search_entity.id,
+        type=SearchItemType.ENTITY.value,
+        title="Bulk Updated Title",
+        content_stems="bulk updated content",
+        content_snippet="Bulk updated content snippet",
+        permalink=search_entity.permalink,  # Same permalink!
+        file_path=search_entity.file_path,
+        entity_id=search_entity.id,
+        metadata={"note_type": search_entity.note_type},
+        created_at=search_entity.created_at,
+        updated_at=search_entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    # This should succeed without raising IntegrityError
+    await search_repository.bulk_index_items([search_row2])
+
+    # Verify the row was updated
+    results_after = await search_repository.search(search_text="bulk updated")
+    assert len(results_after) == 1
+    assert results_after[0].title == "Bulk Updated Title"
+
+
+@pytest.mark.asyncio
 async def test_project_isolation(
     search_repository, second_project_repository, search_entity, second_entity
 ):
@@ -129,7 +305,7 @@ async def test_project_isolation(
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -144,7 +320,7 @@ async def test_project_isolation(
         permalink=second_entity.permalink,
         file_path=second_entity.file_path,
         entity_id=second_entity.id,
-        metadata={"entity_type": second_entity.entity_type},
+        metadata={"note_type": second_entity.note_type},
         created_at=second_entity.created_at,
         updated_at=second_entity.updated_at,
         project_id=second_project_repository.project_id,
@@ -188,7 +364,7 @@ async def test_delete_by_permalink(search_repository, search_entity):
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -221,7 +397,7 @@ async def test_delete_by_entity_id(search_repository, search_entity):
         permalink=search_entity.permalink,
         file_path=search_entity.file_path,
         entity_id=search_entity.id,
-        metadata={"entity_type": search_entity.entity_type},
+        metadata={"note_type": search_entity.note_type},
         created_at=search_entity.created_at,
         updated_at=search_entity.updated_at,
         project_id=search_repository.project_id,
@@ -304,33 +480,69 @@ def test_directory_property():
 
 
 class TestSearchTermPreparation:
-    """Test cases for FTS5 search term preparation."""
+    """Test cases for search term preparation.
+
+    Note: Tests with `[sqlite]` marker test SQLite FTS5-specific implementation details.
+    Tests with `[asyncio-sqlite]` or `[asyncio-postgres]` test backend-agnostic functionality.
+    """
 
     def test_simple_terms_get_prefix_wildcard(self, search_repository):
         """Simple alphanumeric terms should get prefix matching."""
-        assert search_repository._prepare_search_term("hello") == "hello*"
-        assert search_repository._prepare_search_term("project") == "project*"
-        assert search_repository._prepare_search_term("test123") == "test123*"
+        from basic_memory.repository.postgres_search_repository import PostgresSearchRepository
+
+        if isinstance(search_repository, PostgresSearchRepository):
+            # Postgres tsquery uses :* for prefix matching
+            assert search_repository._prepare_search_term("hello") == "hello:*"
+            assert search_repository._prepare_search_term("project") == "project:*"
+            assert search_repository._prepare_search_term("test123") == "test123:*"
+        else:
+            # SQLite FTS5 uses * for prefix matching
+            assert search_repository._prepare_search_term("hello") == "hello*"
+            assert search_repository._prepare_search_term("project") == "project*"
+            assert search_repository._prepare_search_term("test123") == "test123*"
 
     def test_terms_with_existing_wildcard_unchanged(self, search_repository):
         """Terms that already contain * should remain unchanged."""
-        assert search_repository._prepare_search_term("hello*") == "hello*"
-        assert search_repository._prepare_search_term("test*world") == "test*world"
+        if is_postgres_backend(search_repository):
+            # Postgres uses different syntax (:* instead of *)
+            assert search_repository._prepare_search_term("hello*") == "hello:*"
+            assert search_repository._prepare_search_term("test*world") == "test:*world"
+        else:
+            assert search_repository._prepare_search_term("hello*") == "hello*"
+            assert search_repository._prepare_search_term("test*world") == "test*world"
 
     def test_boolean_operators_preserved(self, search_repository):
         """Boolean operators should be preserved without modification."""
-        assert search_repository._prepare_search_term("hello AND world") == "hello AND world"
-        assert search_repository._prepare_search_term("cat OR dog") == "cat OR dog"
-        assert (
-            search_repository._prepare_search_term("project NOT meeting") == "project NOT meeting"
-        )
-        assert (
-            search_repository._prepare_search_term("(hello AND world) OR test")
-            == "(hello AND world) OR test"
-        )
+        if is_postgres_backend(search_repository):
+            # Postgres converts AND/OR/NOT to &/|/!
+            assert search_repository._prepare_search_term("hello AND world") == "hello & world"
+            assert search_repository._prepare_search_term("cat OR dog") == "cat | dog"
+            # NOT must be converted to "& !" for proper tsquery syntax
+            assert (
+                search_repository._prepare_search_term("project NOT meeting")
+                == "project & !meeting"
+            )
+            assert (
+                search_repository._prepare_search_term("(hello AND world) OR test")
+                == "(hello & world) | test"
+            )
+        else:
+            assert search_repository._prepare_search_term("hello AND world") == "hello AND world"
+            assert search_repository._prepare_search_term("cat OR dog") == "cat OR dog"
+            assert (
+                search_repository._prepare_search_term("project NOT meeting")
+                == "project NOT meeting"
+            )
+            assert (
+                search_repository._prepare_search_term("(hello AND world) OR test")
+                == "(hello AND world) OR test"
+            )
 
     def test_hyphenated_terms_with_boolean_operators(self, search_repository):
         """Hyphenated terms with Boolean operators should be properly quoted."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific quoting behavior")
+
         # Test the specific case from the GitHub issue
         result = search_repository._prepare_search_term("tier1-test AND unicode")
         assert result == '"tier1-test" AND unicode'
@@ -361,6 +573,9 @@ class TestSearchTermPreparation:
 
     def test_programming_terms_should_work(self, search_repository):
         """Programming-related terms with special chars should be searchable."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific behavior")
+
         # These should be quoted to handle special characters safely
         assert search_repository._prepare_search_term("C++") == '"C++"*'
         assert search_repository._prepare_search_term("function()") == '"function()"*'
@@ -370,6 +585,9 @@ class TestSearchTermPreparation:
 
     def test_malformed_fts5_syntax_quoted(self, search_repository):
         """Malformed FTS5 syntax should be quoted to prevent errors."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific behavior")
+
         # Multiple operators without proper syntax
         assert search_repository._prepare_search_term("+++invalid+++") == '"+++invalid+++"*'
         assert search_repository._prepare_search_term("!!!error!!!") == '"!!!error!!!"*'
@@ -377,11 +595,17 @@ class TestSearchTermPreparation:
 
     def test_quoted_strings_handled_properly(self, search_repository):
         """Strings with quotes should have quotes escaped."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific behavior")
+
         assert search_repository._prepare_search_term('say "hello"') == '"say ""hello"""*'
         assert search_repository._prepare_search_term("it's working") == '"it\'s working"*'
 
     def test_file_paths_no_prefix_wildcard(self, search_repository):
         """File paths should not get prefix wildcards."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific behavior")
+
         assert (
             search_repository._prepare_search_term("config.json", is_prefix=False)
             == '"config.json"'
@@ -393,6 +617,9 @@ class TestSearchTermPreparation:
 
     def test_spaces_handled_correctly(self, search_repository):
         """Terms with spaces should use boolean AND for word order independence."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific behavior")
+
         assert search_repository._prepare_search_term("hello world") == "hello* AND world*"
         assert (
             search_repository._prepare_search_term("project planning") == "project* AND planning*"
@@ -400,6 +627,9 @@ class TestSearchTermPreparation:
 
     def test_version_strings_with_dots_handled_correctly(self, search_repository):
         """Version strings with dots should be quoted to prevent FTS5 syntax errors."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific behavior")
+
         # This reproduces the bug where "Basic Memory v0.13.0b2" becomes "Basic* AND Memory* AND v0.13.0b2*"
         # which causes FTS5 syntax errors because v0.13.0b2* is not valid FTS5 syntax
         result = search_repository._prepare_search_term("Basic Memory v0.13.0b2")
@@ -408,6 +638,9 @@ class TestSearchTermPreparation:
 
     def test_mixed_special_characters_in_multi_word_queries(self, search_repository):
         """Multi-word queries with special characters in any word should be fully quoted."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific behavior")
+
         # Any word containing special characters should cause the entire phrase to be quoted
         assert search_repository._prepare_search_term("config.json file") == '"config.json file"*'
         assert (
@@ -466,19 +699,18 @@ class TestSearchTermPreparation:
     @pytest.mark.asyncio
     async def test_fts5_error_handling_database_error(self, search_repository):
         """Test that non-FTS5 database errors are properly re-raised."""
-        import unittest.mock
+        # Force a real database error (not an FTS5 syntax error) by removing the search index.
+        # The repository should re-raise the error rather than returning an empty list.
+        async with db.scoped_session(search_repository.session_maker) as session:
+            await session.execute(text("DROP TABLE IF EXISTS search_index"))
+            await session.commit()
 
-        # Mock the scoped_session to raise a non-FTS5 error
-        with unittest.mock.patch("basic_memory.db.scoped_session") as mock_scoped_session:
-            mock_session = unittest.mock.AsyncMock()
-            mock_scoped_session.return_value.__aenter__.return_value = mock_session
-
-            # Simulate a database error that's NOT an FTS5 syntax error
-            mock_session.execute.side_effect = Exception("Database connection failed")
-
-            # This should re-raise the exception (not return empty list)
-            with pytest.raises(Exception, match="Database connection failed"):
+        try:
+            with pytest.raises(Exception):
                 await search_repository.search(search_text="test")
+        finally:
+            # Restore index so later tests in this module keep working.
+            await search_repository.init_search_index()
 
     @pytest.mark.asyncio
     async def test_version_string_search_integration(self, search_repository, search_entity):
@@ -493,7 +725,7 @@ class TestSearchTermPreparation:
             permalink=search_entity.permalink,
             file_path=search_entity.file_path,
             entity_id=search_entity.id,
-            metadata={"entity_type": search_entity.entity_type},
+            metadata={"note_type": search_entity.note_type},
             created_at=search_entity.created_at,
             updated_at=search_entity.updated_at,
             project_id=search_repository.project_id,
@@ -527,7 +759,7 @@ class TestSearchTermPreparation:
             permalink=search_entity.permalink,
             file_path=search_entity.file_path,
             entity_id=search_entity.id,
-            metadata={"entity_type": search_entity.entity_type},
+            metadata={"note_type": search_entity.note_type},
             created_at=search_entity.created_at,
             updated_at=search_entity.updated_at,
             project_id=search_repository.project_id,
@@ -564,6 +796,9 @@ class TestSearchTermPreparation:
 
     def test_parenthetical_term_quote_escaping(self, search_repository):
         """Test quote escaping in parenthetical terms (lines 190-191 coverage)."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific behavior")
+
         # Test term with quotes that needs escaping
         result = search_repository._prepare_parenthetical_term('(say "hello" world)')
         # Should escape quotes by doubling them
@@ -575,6 +810,9 @@ class TestSearchTermPreparation:
 
     def test_needs_quoting_empty_input(self, search_repository):
         """Test _needs_quoting with empty inputs (line 207 coverage)."""
+        if is_postgres_backend(search_repository):
+            pytest.skip("This test is for SQLite FTS5-specific behavior")
+
         # Test empty string
         assert not search_repository._needs_quoting("")
 
@@ -597,3 +835,140 @@ class TestSearchTermPreparation:
         # Test string that becomes empty after strip
         result3 = search_repository._prepare_single_term("\t\n")
         assert result3 == "\t\n"  # Should return original
+
+
+async def _index_entity_with_metadata(search_repository, session_maker, title, entity_metadata):
+    slug = "-".join(title.lower().split())
+    file_path = f"test/{slug}.md"
+    permalink = f"test/{slug}"
+    now = datetime.now(timezone.utc)
+
+    async with db.scoped_session(session_maker) as session:
+        entity = Entity(
+            project_id=search_repository.project_id,
+            title=title,
+            note_type="note",
+            permalink=permalink,
+            file_path=file_path,
+            content_type="text/markdown",
+            entity_metadata=entity_metadata,
+            created_at=now,
+            updated_at=now,
+        )
+        session.add(entity)
+        await session.flush()
+
+    search_row = SearchIndexRow(
+        id=entity.id,
+        type=SearchItemType.ENTITY.value,
+        title=entity.title,
+        content_stems="metadata filter test",
+        content_snippet="metadata filter test",
+        permalink=entity.permalink,
+        file_path=entity.file_path,
+        entity_id=entity.id,
+        metadata={"note_type": entity.note_type},
+        created_at=entity.created_at,
+        updated_at=entity.updated_at,
+        project_id=search_repository.project_id,
+    )
+    await search_repository.index_item(search_row)
+    return entity
+
+
+@pytest.mark.asyncio
+async def test_search_metadata_filters_eq_and_in(search_repository, session_maker):
+    entity_match = await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Metadata Match",
+        {"status": "in-progress", "priority": "high"},
+    )
+    await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Metadata Miss",
+        {"status": "done", "priority": "low"},
+    )
+
+    results = await search_repository.search(metadata_filters={"status": "in-progress"})
+    assert {result.id for result in results} == {entity_match.id}
+
+    results = await search_repository.search(
+        metadata_filters={"priority": {"$in": ["high", "critical"]}}
+    )
+    assert {result.id for result in results} == {entity_match.id}
+
+
+@pytest.mark.asyncio
+async def test_search_metadata_filters_contains_tags(search_repository, session_maker):
+    entity_match = await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Tag Match",
+        {"tags": ["security", "oauth", "architecture"]},
+    )
+    await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Tag Miss",
+        {"tags": ["security"]},
+    )
+
+    results = await search_repository.search(metadata_filters={"tags": ["security", "oauth"]})
+    assert {result.id for result in results} == {entity_match.id}
+
+
+@pytest.mark.asyncio
+async def test_search_metadata_filters_numeric_comparisons(search_repository, session_maker):
+    entity_high = await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Confidence High",
+        {"schema": {"confidence": 0.8}},
+    )
+    entity_low = await _index_entity_with_metadata(
+        search_repository,
+        session_maker,
+        "Confidence Low",
+        {"schema": {"confidence": 0.4}},
+    )
+
+    results = await search_repository.search(metadata_filters={"schema.confidence": {"$gt": 0.7}})
+    assert {result.id for result in results} == {entity_high.id}
+
+    results = await search_repository.search(
+        metadata_filters={"schema.confidence": {"$between": [0.3, 0.6]}}
+    )
+    assert {result.id for result in results} == {entity_low.id}
+
+
+# --- SQL injection safety tests ---
+# These tests verify that user-supplied filter values are parameterized and cannot
+# alter query structure. Each test passes a malicious payload and asserts the query
+# completes safely (returning empty results) rather than causing a SQL error or
+# data exfiltration.
+
+
+@pytest.mark.asyncio
+async def test_note_types_sql_injection_returns_empty(search_repository):
+    """note_types with SQL injection payload must not alter query structure."""
+    malicious_payloads = [
+        "note' OR '1'='1",
+        "note'; DROP TABLE search_index;--",
+        'note" OR 1=1--',
+        "note') UNION SELECT * FROM entity--",
+    ]
+    for payload in malicious_payloads:
+        results = await search_repository.search(note_types=[payload])
+        # Injection should be treated as a literal string value, not executed as SQL
+        assert results == [], f"Injection payload should not match: {payload}"
+
+
+@pytest.mark.asyncio
+async def test_search_item_types_parameterized(search_repository):
+    """search_item_types enum values are parameterized, not interpolated."""
+    # Normal enum usage still works
+    results = await search_repository.search(search_item_types=[SearchItemType.ENTITY])
+    # Should not raise — parameterized query handles enum values safely
+    assert isinstance(results, list)

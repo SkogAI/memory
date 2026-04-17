@@ -56,7 +56,7 @@ async def test_project_metadata_consistency(mcp_server, app, test_project):
 
 
 @pytest.mark.asyncio
-async def test_create_project_basic_operation(mcp_server, app, test_project):
+async def test_create_project_basic_operation(mcp_server, app, test_project, tmp_path):
     """Test creating a new project with basic parameters."""
 
     async with Client(mcp_server) as client:
@@ -65,7 +65,9 @@ async def test_create_project_basic_operation(mcp_server, app, test_project):
             "create_memory_project",
             {
                 "project_name": "test-new-project",
-                "project_path": "/tmp/test-new-project",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / "project-test-new-project"
+                ),
             },
         )
 
@@ -77,7 +79,8 @@ async def test_create_project_basic_operation(mcp_server, app, test_project):
         assert "test-new-project" in create_text
         assert "Project Details:" in create_text
         assert "Name: test-new-project" in create_text
-        assert "Path: /tmp/test-new-project" in create_text
+        # Check path contains project name (platform-independent)
+        assert "Path:" in create_text and "test-new-project" in create_text
         assert "Project is now available for use" in create_text
 
         # Verify project appears in project list
@@ -87,7 +90,7 @@ async def test_create_project_basic_operation(mcp_server, app, test_project):
 
 
 @pytest.mark.asyncio
-async def test_create_project_with_default_flag(mcp_server, app, test_project):
+async def test_create_project_with_default_flag(mcp_server, app, test_project, tmp_path):
     """Test creating a project and setting it as default."""
 
     async with Client(mcp_server) as client:
@@ -96,7 +99,9 @@ async def test_create_project_with_default_flag(mcp_server, app, test_project):
             "create_memory_project",
             {
                 "project_name": "test-default-project",
-                "project_path": "/tmp/test-default-project",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / "project-test-default-project"
+                ),
                 "set_default": True,
             },
         )
@@ -115,8 +120,8 @@ async def test_create_project_with_default_flag(mcp_server, app, test_project):
 
 
 @pytest.mark.asyncio
-async def test_create_project_duplicate_name(mcp_server, app, test_project):
-    """Test creating a project with duplicate name shows error."""
+async def test_create_project_duplicate_name(mcp_server, app, test_project, tmp_path):
+    """Test creating a project with duplicate name is idempotent."""
 
     async with Client(mcp_server) as client:
         # First create a project
@@ -124,32 +129,46 @@ async def test_create_project_duplicate_name(mcp_server, app, test_project):
             "create_memory_project",
             {
                 "project_name": "duplicate-test",
-                "project_path": "/tmp/duplicate-test-1",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / "project-duplicate-test-1"
+                ),
             },
         )
 
-        # Try to create another project with same name
-        with pytest.raises(Exception) as exc_info:
-            await client.call_tool(
-                "create_memory_project",
-                {
-                    "project_name": "duplicate-test",
-                    "project_path": "/tmp/duplicate-test-2",
-                },
-            )
+        # Second create with same name should succeed idempotently
+        second_result = await client.call_tool(
+            "create_memory_project",
+            {
+                "project_name": "duplicate-test",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / "project-duplicate-test-2"
+                ),
+            },
+        )
+        second_text = second_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
+        assert "already exists" in second_text.lower()
+        assert "duplicate-test" in second_text
 
-        # Should show error about duplicate name
-        error_message = str(exc_info.value)
-        assert "create_memory_project" in error_message
+        # JSON mode should explicitly report already_exists=true
+        second_json = await client.call_tool(
+            "create_memory_project",
+            {
+                "project_name": "duplicate-test",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / "project-duplicate-test-3"
+                ),
+                "output_format": "json",
+            },
+        )
+        second_json_text = second_json.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
         assert (
-            "duplicate-test" in error_message
-            or "already exists" in error_message
-            or "Invalid request" in error_message
+            '"already_exists":true' in second_json_text
+            or '"already_exists": true' in second_json_text
         )
 
 
 @pytest.mark.asyncio
-async def test_delete_project_basic_operation(mcp_server, app, test_project):
+async def test_delete_project_basic_operation(mcp_server, app, test_project, tmp_path):
     """Test deleting a project that exists."""
 
     async with Client(mcp_server) as client:
@@ -158,7 +177,9 @@ async def test_delete_project_basic_operation(mcp_server, app, test_project):
             "create_memory_project",
             {
                 "project_name": "to-be-deleted",
-                "project_path": "/tmp/to-be-deleted",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / "project-to-be-deleted"
+                ),
             },
         )
 
@@ -239,12 +260,14 @@ async def test_delete_current_project_protection(mcp_server, app, test_project):
 
 
 @pytest.mark.asyncio
-async def test_project_lifecycle_workflow(mcp_server, app, test_project):
+async def test_project_lifecycle_workflow(mcp_server, app, test_project, tmp_path):
     """Test complete project lifecycle: create, switch, use, delete."""
 
     async with Client(mcp_server) as client:
         project_name = "lifecycle-test"
-        project_path = "/tmp/lifecycle-test"
+        project_path = str(
+            tmp_path.parent / (tmp_path.name + "-projects") / "project-lifecycle-test"
+        )
 
         # 1. Create new project
         create_result = await client.call_tool(
@@ -263,7 +286,7 @@ async def test_project_lifecycle_workflow(mcp_server, app, test_project):
             {
                 "project": project_name,
                 "title": "Lifecycle Test Note",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Lifecycle Test\\n\\nThis note tests the project lifecycle.\\n\\n- [test] Lifecycle testing",
                 "tags": "lifecycle,test",
             },
@@ -294,7 +317,7 @@ async def test_project_lifecycle_workflow(mcp_server, app, test_project):
 
 
 @pytest.mark.asyncio
-async def test_create_delete_project_edge_cases(mcp_server, app, test_project):
+async def test_create_delete_project_edge_cases(mcp_server, app, test_project, tmp_path):
     """Test edge cases for create and delete project operations."""
 
     async with Client(mcp_server) as client:
@@ -306,7 +329,11 @@ async def test_create_delete_project_edge_cases(mcp_server, app, test_project):
             "create_memory_project",
             {
                 "project_name": special_name,
-                "project_path": "/tmp/test-project-with-special-chars",
+                "project_path": str(
+                    tmp_path.parent
+                    / (tmp_path.name + "-projects")
+                    / "project-test-project-with-special-chars"
+                ),
             },
         )
         assert "✓" in create_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
@@ -332,7 +359,7 @@ async def test_create_delete_project_edge_cases(mcp_server, app, test_project):
 
 
 @pytest.mark.asyncio
-async def test_case_insensitive_project_switching(mcp_server, app, test_project):
+async def test_case_insensitive_project_switching(mcp_server, app, test_project, tmp_path):
     """Test case-insensitive project switching with proper database lookup."""
 
     async with Client(mcp_server) as client:
@@ -342,7 +369,9 @@ async def test_case_insensitive_project_switching(mcp_server, app, test_project)
             "create_memory_project",
             {
                 "project_name": project_name,
-                "project_path": f"/tmp/{project_name}",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / f"project-{project_name}"
+                ),
             },
         )
         assert "✓" in create_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
@@ -371,7 +400,7 @@ async def test_case_insensitive_project_switching(mcp_server, app, test_project)
                 {
                     "project": test_input,  # Use different case
                     "title": f"Case Test {test_input}",
-                    "folder": "case-test",
+                    "directory": "case-test",
                     "content": f"# Case Test\n\nTesting with {test_input}",
                 },
             )
@@ -383,7 +412,7 @@ async def test_case_insensitive_project_switching(mcp_server, app, test_project)
 
 
 @pytest.mark.asyncio
-async def test_case_insensitive_project_operations(mcp_server, app, test_project):
+async def test_case_insensitive_project_operations(mcp_server, app, test_project, tmp_path):
     """Test that all project operations work correctly after case-insensitive switching."""
 
     async with Client(mcp_server) as client:
@@ -393,7 +422,9 @@ async def test_case_insensitive_project_operations(mcp_server, app, test_project
             "create_memory_project",
             {
                 "project_name": project_name,
-                "project_path": f"/tmp/{project_name}",
+                "project_path": str(
+                    tmp_path.parent / (tmp_path.name + "-projects") / f"project-{project_name}"
+                ),
             },
         )
         assert "✓" in create_result.content[0].text  # pyright: ignore [reportAttributeAccessIssue]
@@ -406,7 +437,7 @@ async def test_case_insensitive_project_operations(mcp_server, app, test_project
             {
                 "project": project_name,
                 "title": "Case Test Note",
-                "folder": "case-test",
+                "directory": "case-test",
                 "content": "# Case Test Note\n\nTesting case-insensitive operations.\n\n- [test] Case insensitive switch\n- relates_to [[Another Note]]",
                 "tags": "case,test",
             },
@@ -457,14 +488,14 @@ async def test_case_insensitive_error_handling(mcp_server, app, test_project):
                     {
                         "project": test_case,
                         "title": "Test Note",
-                        "folder": "test",
+                        "directory": "test",
                         "content": "# Test\n\nTest content.",
                     },
                 )
 
 
 @pytest.mark.asyncio
-async def test_case_preservation_in_project_list(mcp_server, app, test_project):
+async def test_case_preservation_in_project_list(mcp_server, app, test_project, tmp_path):
     """Test that project names preserve their original case in listings."""
 
     async with Client(mcp_server) as client:
@@ -482,7 +513,9 @@ async def test_case_preservation_in_project_list(mcp_server, app, test_project):
                 "create_memory_project",
                 {
                     "project_name": project_name,
-                    "project_path": f"/tmp/{project_name}",
+                    "project_path": str(
+                        tmp_path.parent / (tmp_path.name + "-projects") / f"project-{project_name}"
+                    ),
                 },
             )
 
@@ -501,7 +534,7 @@ async def test_case_preservation_in_project_list(mcp_server, app, test_project):
                 {
                     "project": project_name,  # Use exact project name
                     "title": f"Test Note {project_name}",
-                    "folder": "test",
+                    "directory": "test",
                     "content": f"# Test\n\nTesting {project_name}",
                 },
             )
@@ -512,3 +545,46 @@ async def test_case_preservation_in_project_list(mcp_server, app, test_project):
         # Clean up - delete test projects
         for project_name in test_projects:
             await client.call_tool("delete_project", {"project_name": project_name})
+
+
+@pytest.mark.asyncio
+async def test_nested_project_paths_rejected(mcp_server, app, test_project, tmp_path):
+    """Test that creating nested project paths is rejected with clear error message."""
+
+    async with Client(mcp_server) as client:
+        # Create a parent project
+        parent_name = "parent-project"
+        parent_path = str(
+            tmp_path.parent / (tmp_path.name + "-projects") / "project-nested-test/parent"
+        )
+
+        await client.call_tool(
+            "create_memory_project",
+            {
+                "project_name": parent_name,
+                "project_path": parent_path,
+            },
+        )
+
+        # Try to create a child project nested under the parent
+        child_name = "child-project"
+        child_path = str(
+            tmp_path.parent / (tmp_path.name + "-projects") / "project-nested-test/parent/child"
+        )
+
+        with pytest.raises(Exception) as exc_info:
+            await client.call_tool(
+                "create_memory_project",
+                {
+                    "project_name": child_name,
+                    "project_path": child_path,
+                },
+            )
+
+        # Verify error message mentions nested paths
+        error_message = str(exc_info.value)
+        assert "nested" in error_message.lower()
+        assert parent_name in error_message or parent_path in error_message
+
+        # Clean up parent project
+        await client.call_tool("delete_project", {"project_name": parent_name})

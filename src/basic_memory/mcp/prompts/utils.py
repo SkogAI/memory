@@ -8,7 +8,6 @@ from dataclasses import dataclass
 from textwrap import dedent
 from typing import List
 
-from basic_memory.schemas.base import TimeFrame
 from basic_memory.schemas.memory import (
     normalize_memory_url,
     EntitySummary,
@@ -25,7 +24,7 @@ class PromptContextItem:
 
 @dataclass
 class PromptContext:
-    timeframe: TimeFrame
+    timeframe: str
     topic: str
     results: List[PromptContextItem]
 
@@ -96,17 +95,24 @@ def format_prompt_context(context: PromptContext) -> str:
     sections = []
 
     # Process each context
-    for context in context.results:  # pyright: ignore
-        for primary in context.primary_results:  # pyright: ignore
+    for context_item in context.results:
+        for primary in context_item.primary_results:
             if primary.permalink not in added_permalinks:
                 primary_permalink = primary.permalink
 
                 added_permalinks.add(primary_permalink)
 
-                memory_url = normalize_memory_url(primary_permalink)
+                # Use permalink if available, otherwise use file_path
+                if primary_permalink:
+                    memory_url = normalize_memory_url(primary_permalink)
+                    read_command = f'read_note("{primary_permalink}")'
+                else:
+                    memory_url = f"file://{primary.file_path}"
+                    read_command = f'read_file("{primary.file_path}")'
+
                 section = dedent(f"""
                     --- {memory_url}
-                
+
                     ## {primary.title}
                     - **Type**: {primary.type}
                     """)
@@ -115,25 +121,25 @@ def format_prompt_context(context: PromptContext) -> str:
                 section += f"- **Created**: {primary.created_at.strftime('%Y-%m-%d %H:%M')}\n"
 
                 # Add content snippet
-                if hasattr(primary, "content") and primary.content:  # pyright: ignore
-                    content = primary.content or ""  # pyright: ignore
-                    if content:
-                        section += f"\n**Excerpt**:\n{content}\n"
+                if hasattr(primary, "content") and primary.content:
+                    content = primary.content or ""  # pragma: no cover
+                    if content:  # pragma: no cover
+                        section += f"\n**Excerpt**:\n{content}\n"  # pragma: no cover
 
                 section += dedent(f"""
-    
-                    You can read this document with: `read_note("{primary_permalink}")`
+
+                    You can read this document with: `{read_command}`
                     """)
                 sections.append(section)
 
-        if context.related_results:  # pyright: ignore
-            section += dedent(  # pyright: ignore
+        if context_item.related_results:
+            section += dedent(
                 """   
                 ## Related Context
                 """
             )
 
-            for related in context.related_results:  # pyright: ignore
+            for related in context_item.related_results:
                 section_content = dedent(f"""
                     - type: **{related.type}**
                     - title: {related.title}

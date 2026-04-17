@@ -15,6 +15,19 @@ logger = logging.getLogger(__name__)
 class ChatGPTImporter(Importer[ChatImportResult]):
     """Service for importing ChatGPT conversations."""
 
+    def handle_error(  # pragma: no cover
+        self, message: str, error: Optional[Exception] = None
+    ) -> ChatImportResult:
+        """Return a failed ChatImportResult with an error message."""
+        error_msg = f"{message}: {error}" if error else message
+        return ChatImportResult(
+            import_count={},
+            success=False,
+            error_message=error_msg,
+            conversations=0,
+            messages=0,
+        )
+
     async def import_data(
         self, source_data, destination_folder: str, **kwargs: Any
     ) -> ChatImportResult:
@@ -30,7 +43,7 @@ class ChatGPTImporter(Importer[ChatImportResult]):
         """
         try:  # pragma: no cover
             # Ensure the destination folder exists
-            self.ensure_folder_exists(destination_folder)
+            await self.ensure_folder_exists(destination_folder)
             conversations = source_data
 
             # Process each conversation
@@ -38,11 +51,20 @@ class ChatGPTImporter(Importer[ChatImportResult]):
             chats_imported = 0
 
             for chat in conversations:
-                # Convert to entity
-                entity = self._format_chat_content(destination_folder, chat)
+                created_at = chat["create_time"]
+                date_prefix = datetime.fromtimestamp(created_at).astimezone().strftime("%Y%m%d")
+                clean_title = clean_filename(chat["title"])
+                relative_path = (
+                    f"{destination_folder}/{date_prefix}-{clean_title}"
+                    if destination_folder
+                    else f"{date_prefix}-{clean_title}"
+                )
+                permalink, file_path = self.build_import_paths(relative_path)
 
-                # Write file
-                file_path = self.base_path / f"{entity.frontmatter.metadata['permalink']}.md"
+                # Convert to entity
+                entity = self._format_chat_content(chat, permalink)
+
+                # Write file using relative path - FileService handles base_path
                 await self.write_entity(entity, file_path)
 
                 # Count messages
@@ -67,10 +89,10 @@ class ChatGPTImporter(Importer[ChatImportResult]):
 
         except Exception as e:  # pragma: no cover
             logger.exception("Failed to import ChatGPT conversations")
-            return self.handle_error("Failed to import ChatGPT conversations", e)  # pyright: ignore [reportReturnType]
+            return self.handle_error("Failed to import ChatGPT conversations", e)
 
     def _format_chat_content(
-        self, folder: str, conversation: Dict[str, Any]
+        self, conversation: Dict[str, Any], permalink: str
     ) -> EntityMarkdown:  # pragma: no cover
         """Convert chat conversation to Basic Memory entity.
 
@@ -92,10 +114,6 @@ class ChatGPTImporter(Importer[ChatImportResult]):
                 root_id = node_id
                 break
 
-        # Generate permalink
-        date_prefix = datetime.fromtimestamp(created_at).astimezone().strftime("%Y%m%d")
-        clean_title = clean_filename(conversation["title"])
-
         # Format content
         content = self._format_chat_markdown(
             title=conversation["title"],
@@ -113,7 +131,7 @@ class ChatGPTImporter(Importer[ChatImportResult]):
                     "title": conversation["title"],
                     "created": format_timestamp(created_at),
                     "modified": format_timestamp(modified_at),
-                    "permalink": f"{folder}/{date_prefix}-{clean_title}",
+                    "permalink": permalink,
                 }
             ),
             content=content,

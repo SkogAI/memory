@@ -4,60 +4,209 @@ import fnmatch
 from pathlib import Path
 from typing import Set
 
+from basic_memory.config import resolve_data_dir
+
 
 # Common directories and patterns to ignore by default
+# These are used as fallback if .bmignore doesn't exist
 DEFAULT_IGNORE_PATTERNS = {
+    # Hidden files (files starting with dot)
+    ".*",
+    # Basic Memory internal files
+    "*.db",
+    "*.db-shm",
+    "*.db-wal",
+    "config.json",
+    # Version control
     ".git",
+    ".svn",
+    # Python
+    "__pycache__",
+    "*.pyc",
+    "*.pyo",
+    "*.pyd",
+    ".pytest_cache",
+    ".coverage",
+    "*.egg-info",
+    ".tox",
+    ".mypy_cache",
+    ".ruff_cache",
+    # Virtual environments
     ".venv",
     "venv",
     "env",
     ".env",
+    # Node.js
     "node_modules",
-    "__pycache__",
-    ".pytest_cache",
-    ".coverage",
-    "*.pyc",
-    "*.pyo",
-    "*.pyd",
-    ".DS_Store",
-    "Thumbs.db",
-    ".idea",
-    ".vscode",
-    "*.egg-info",
+    # Build artifacts
     "build",
     "dist",
-    ".tox",
     ".cache",
-    ".mypy_cache",
-    ".ruff_cache",
-    ".obsidian",
+    # IDE
     ".idea",
+    ".vscode",
+    # OS files
+    ".DS_Store",
+    "Thumbs.db",
+    "desktop.ini",
+    # Obsidian
+    ".obsidian",
+    # Temporary files
+    "*.tmp",
+    "*.swp",
+    "*.swo",
+    "*~",
 }
 
 
-def load_gitignore_patterns(base_path: Path) -> Set[str]:
-    """Load gitignore patterns from .gitignore file and add default patterns.
+def get_bmignore_path() -> Path:
+    """Get path to .bmignore file.
+
+    Returns:
+        Path to <basic-memory data dir>/.bmignore, honoring
+        ``BASIC_MEMORY_CONFIG_DIR`` so isolated instances each keep their
+        own ignore file.
+    """
+    return resolve_data_dir() / ".bmignore"
+
+
+def create_default_bmignore() -> None:
+    """Create default .bmignore file if it doesn't exist.
+
+    This ensures users have a file they can customize for all Basic Memory operations.
+    """
+    bmignore_path = get_bmignore_path()
+
+    if bmignore_path.exists():
+        return
+
+    bmignore_path.parent.mkdir(parents=True, exist_ok=True)
+    bmignore_path.write_text("""# Basic Memory Ignore Patterns
+# This file is used by both 'bm cloud upload', 'bm cloud bisync', and file sync
+# Patterns use standard gitignore-style syntax
+
+# Hidden files (files starting with dot)
+.*
+
+# Basic Memory internal files (includes test databases)
+*.db
+*.db-shm
+*.db-wal
+config.json
+
+# Version control
+.git
+.svn
+
+# Python
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.pytest_cache
+.coverage
+*.egg-info
+.tox
+.mypy_cache
+.ruff_cache
+
+# Virtual environments
+.venv
+venv
+env
+.env
+
+# Node.js
+node_modules
+
+# Build artifacts
+build
+dist
+.cache
+
+# IDE
+.idea
+.vscode
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Obsidian
+.obsidian
+
+# Temporary files
+*.tmp
+*.swp
+*.swo
+*~
+""")
+
+
+def load_bmignore_patterns() -> Set[str]:
+    """Load patterns from .bmignore file.
+
+    Returns:
+        Set of patterns from .bmignore, or DEFAULT_IGNORE_PATTERNS if file doesn't exist
+    """
+    bmignore_path = get_bmignore_path()
+
+    # Create default file if it doesn't exist
+    if not bmignore_path.exists():
+        create_default_bmignore()
+
+    patterns = set()
+
+    try:
+        with bmignore_path.open("r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                # Skip empty lines and comments
+                if line and not line.startswith("#"):
+                    patterns.add(line)
+    except Exception:  # pragma: no cover
+        # If we can't read .bmignore, fall back to defaults
+        return set(DEFAULT_IGNORE_PATTERNS)  # pragma: no cover
+
+    # If no patterns were loaded, use defaults
+    if not patterns:  # pragma: no cover
+        return set(DEFAULT_IGNORE_PATTERNS)  # pragma: no cover
+
+    return patterns
+
+
+def load_gitignore_patterns(base_path: Path, use_gitignore: bool = True) -> Set[str]:
+    """Load gitignore patterns from .gitignore file and .bmignore.
+
+    Combines patterns from:
+    1. <basic-memory data dir>/.bmignore (user's global ignore patterns, honors
+       BASIC_MEMORY_CONFIG_DIR)
+    2. {base_path}/.gitignore (project-specific patterns, if use_gitignore=True)
 
     Args:
         base_path: The base directory to search for .gitignore file
+        use_gitignore: If False, only load patterns from .bmignore (default: True)
 
     Returns:
         Set of patterns to ignore
     """
-    patterns = set(DEFAULT_IGNORE_PATTERNS)
+    # Start with patterns from .bmignore
+    patterns = load_bmignore_patterns()
 
-    gitignore_file = base_path / ".gitignore"
-    if gitignore_file.exists():
-        try:
-            with gitignore_file.open("r", encoding="utf-8") as f:
-                for line in f:
-                    line = line.strip()
-                    # Skip empty lines and comments
-                    if line and not line.startswith("#"):
-                        patterns.add(line)
-        except Exception:
-            # If we can't read .gitignore, just use default patterns
-            pass
+    if use_gitignore:
+        gitignore_file = base_path / ".gitignore"
+        if gitignore_file.exists():
+            try:
+                with gitignore_file.open("r", encoding="utf-8") as f:
+                    for line in f:
+                        line = line.strip()
+                        # Skip empty lines and comments
+                        if line and not line.startswith("#"):
+                            patterns.add(line)
+            except Exception:
+                # If we can't read .gitignore, just use default patterns
+                pass
 
     return patterns
 
@@ -109,9 +258,15 @@ def should_ignore_path(file_path: Path, base_path: Path, ignore_patterns: Set[st
             if pattern in relative_path.parts:
                 return True
 
-            # Glob pattern match
+            # Check if any individual path part matches the glob pattern
+            # This handles cases like ".*" matching ".hidden.md" in "concept/.hidden.md"
+            for part in relative_path.parts:
+                if fnmatch.fnmatch(part, pattern):
+                    return True
+
+            # Glob pattern match on full path
             if fnmatch.fnmatch(relative_posix, pattern) or fnmatch.fnmatch(relative_str, pattern):
-                return True
+                return True  # pragma: no cover
 
         return False
     except ValueError:

@@ -1,18 +1,24 @@
 """Utilities for converting between markdown and entity models."""
 
+import uuid
 from pathlib import Path
 from typing import Any, Optional
+
 
 from frontmatter import Post
 
 from basic_memory.file_utils import has_frontmatter, remove_frontmatter, parse_frontmatter
 from basic_memory.markdown import EntityMarkdown
+from basic_memory.markdown.entity_parser import normalize_frontmatter_metadata
 from basic_memory.models import Entity
 from basic_memory.models import Observation as ObservationModel
 
 
 def entity_model_from_markdown(
-    file_path: Path, markdown: EntityMarkdown, entity: Optional[Entity] = None
+    file_path: Path,
+    markdown: EntityMarkdown,
+    entity: Optional[Entity] = None,
+    project_id: Optional[int] = None,
 ) -> Entity:
     """
     Convert markdown entity to model. Does not include relations.
@@ -21,6 +27,7 @@ def entity_model_from_markdown(
         file_path: Path to the markdown file
         markdown: Parsed markdown entity
         entity: Optional existing entity to update
+        project_id: Project ID for new observations (uses entity.project_id if not provided)
 
     Returns:
         Entity model populated from markdown
@@ -35,9 +42,15 @@ def entity_model_from_markdown(
     # Create or update entity
     model = entity or Entity()
 
+    # Ensure external_id is set for new entities
+    # SQLAlchemy's Python-side default may not always evaluate,
+    # so we explicitly set it here for reliability (fixes #512)
+    if not model.external_id:
+        model.external_id = str(uuid.uuid4())
+
     # Update basic fields
     model.title = markdown.frontmatter.title
-    model.entity_type = markdown.frontmatter.type
+    model.note_type = markdown.frontmatter.type
     # Only update permalink if it exists in frontmatter, otherwise preserve existing
     if markdown.frontmatter.permalink is not None:
         model.permalink = markdown.frontmatter.permalink
@@ -46,13 +59,17 @@ def entity_model_from_markdown(
     model.created_at = markdown.created
     model.updated_at = markdown.modified
 
-    # Handle metadata - ensure all values are strings and filter None
-    metadata = markdown.frontmatter.metadata or {}
-    model.entity_metadata = {k: str(v) for k, v in metadata.items() if v is not None}
+    # Handle metadata - normalize values and filter None (preserve structured data)
+    metadata = normalize_frontmatter_metadata(markdown.frontmatter.metadata or {})
+    model.entity_metadata = {k: v for k, v in metadata.items() if v is not None}
+
+    # Get project_id from entity if not provided
+    obs_project_id = project_id or (model.project_id if hasattr(model, "project_id") else None)
 
     # Convert observations
     model.observations = [
         ObservationModel(
+            project_id=obs_project_id,
             content=obs.content,
             category=obs.category,
             context=obs.context,
@@ -69,7 +86,7 @@ async def schema_to_markdown(schema: Any) -> Post:
     Convert schema to markdown Post object.
 
     Args:
-        schema: Schema to convert (must have title, entity_type, and permalink attributes)
+        schema: Schema to convert (must have title, note_type, and permalink attributes)
 
     Returns:
         Post object with frontmatter metadata
@@ -96,7 +113,7 @@ async def schema_to_markdown(schema: Any) -> Post:
     post = Post(
         content,
         title=schema.title,
-        type=schema.entity_type,
+        type=schema.note_type,
     )
     # set the permalink if passed in
     if schema.permalink:

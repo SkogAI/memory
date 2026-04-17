@@ -1,3 +1,4 @@
+<!-- mcp-name: io.github.basicmachines-co/basic-memory -->
 [![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](https://www.gnu.org/licenses/agpl-3.0)
 [![PyPI version](https://badge.fury.io/py/basic-memory.svg)](https://badge.fury.io/py/basic-memory)
 [![Python 3.12+](https://img.shields.io/badge/python-3.12+-blue.svg)](https://www.python.org/downloads/)
@@ -5,7 +6,16 @@
 [![Ruff](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/astral-sh/ruff/main/assets/badge/v2.json)](https://github.com/astral-sh/ruff)
 ![](https://badge.mcpx.dev?type=server 'MCP Server')
 ![](https://badge.mcpx.dev?type=dev 'MCP Dev')
-[![smithery badge](https://smithery.ai/badge/@basicmachines-co/basic-memory)](https://smithery.ai/server/@basicmachines-co/basic-memory)
+
+## 🚀 Basic Memory Cloud is Live!
+
+- **Cross-device and multi-platform support is here.** Your knowledge graph now works on desktop, web, and mobile.
+- **Cloud is optional.** The local-first open-source workflow continues as always.
+- **OSS discount:** use code `BMFOSS` for 20% off for 3 months.
+
+[Sign up now →](https://basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme)
+
+with a 7 day free trial
 
 # Basic Memory
 
@@ -13,8 +23,21 @@ Basic Memory lets you build persistent knowledge through natural conversations w
 Claude, while keeping everything in simple Markdown files on your computer. It uses the Model Context Protocol (MCP) to
 enable any compatible LLM to read and write to your local knowledge base.
 
-- Website: https://basicmachines.co
-- Documentation: https://memory.basicmachines.co
+## What's New in v0.19.0
+
+- **Semantic Vector Search** — find notes by meaning, not just keywords. Combines full-text and vector similarity for hybrid search with FastEmbed embeddings.
+- **Schema System** — infer, validate, and diff the structure of your knowledge base with `schema_infer`, `schema_validate`, and `schema_diff` tools.
+- **Per-Project Cloud Routing** — route individual projects through the cloud while others stay local, using API key authentication (`basic-memory project set-cloud`).
+- **FastMCP 3.0** — upgraded to FastMCP 3.0 with tool annotations for better client integration.
+- **CLI Overhaul** — JSON output mode (`--json`) for scripting, workspace-aware commands, and an htop-inspired project dashboard.
+- **Smarter Editing** — `edit_note` append/prepend auto-creates notes if they don't exist; `write_note` has an overwrite guard to prevent accidental data loss.
+- **Richer Search Results** — matched chunk text returned in search results for better context.
+
+See the full [CHANGELOG](CHANGELOG.md) for details.
+
+- Website: [basicmemory.com](https://basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme)
+- Documentation: [docs.basicmemory.com](https://docs.basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme)
+- Community: [Discord](https://discord.gg/tyvKNccgqN?utm_source=github&utm_medium=referral&utm_campaign=readme)
 
 ## Pick up your conversation right where you left off
 
@@ -52,23 +75,35 @@ uv tool install basic-memory
 
 You can view shared context via files in `~/basic-memory` (default directory location).
 
-### Alternative Installation via Smithery
+## Automatic Updates
 
-You can use [Smithery](https://smithery.ai/server/@basicmachines-co/basic-memory) to automatically configure Basic
-Memory for Claude Desktop:
+Basic Memory includes a default-on auto-update flow for CLI installs.
+
+- **Auto-install supported:** `uv tool` and Homebrew installs
+- **Default check interval:** every 24 hours (`86400` seconds)
+- **MCP-safe behavior:** update checks run silently in `basic-memory mcp` mode
+- **`uvx` behavior:** skipped (runtime is ephemeral and managed by `uvx`)
+
+Manual update commands:
 
 ```bash
-npx -y @smithery/cli install @basicmachines-co/basic-memory --client claude
+# Check now and install if supported
+bm update
+
+# Check only, do not install
+bm update --check
 ```
 
-This installs and configures Basic Memory without requiring manual edits to the Claude Desktop configuration file. The
-Smithery server hosts the MCP server component, while your data remains stored locally as Markdown files.
+Config options in `~/.basic-memory/config.json`:
 
-### Glama.ai
+```json
+{
+  "auto_update": true,
+  "update_check_interval": 86400
+}
+```
 
-<a href="https://glama.ai/mcp/servers/o90kttu9ym">
-  <img width="380" height="200" src="https://glama.ai/mcp/servers/o90kttu9ym/badge" alt="basic-memory MCP server" />
-</a>
+To disable automatic updates, set `"auto_update": false`.
 
 ## Why Basic Memory?
 
@@ -100,6 +135,9 @@ With Basic Memory, you can:
 - Keep everything local and under your control
 - Use familiar tools like Obsidian to view and edit notes
 - Build a personal knowledge base that grows over time
+- Sync your knowledge to the cloud with bidirectional synchronization
+- Authenticate and manage cloud projects with subscription validation
+- Mount cloud storage for direct file access
 
 ## How It Works in Practice
 
@@ -346,14 +384,125 @@ basic-memory sync
 basic-memory sync --watch
 ```
 
-3. In Claude Desktop, the LLM can now use these tools:
+3. Cloud features (optional, requires subscription):
 
+```bash
+# Authenticate with cloud (stores OAuth token locally)
+basic-memory cloud login
+
+# (Optional) install/configure rclone for file sync commands
+basic-memory cloud setup
+
+# Check cloud auth + health
+basic-memory cloud status
 ```
-write_note(title, content, folder, tags) - Create or update notes
-read_note(identifier, page, page_size) - Read notes by title or permalink
-build_context(url, depth, timeframe) - Navigate knowledge graph via memory:// URLs
+
+**Per-Project Cloud Routing** (API key based):
+
+Individual projects can be routed through the cloud while others stay local. This uses an API key for routed
+project calls:
+
+```bash
+# Save an API key (create one in the web app or via CLI)
+basic-memory cloud set-key bmc_abc123...
+# Or create one via CLI (requires OAuth login first)
+basic-memory cloud create-key "my-laptop"
+
+# Set a project to route through cloud
+basic-memory project set-cloud research
+
+# Revert a project to local mode
+basic-memory project set-local research
+
+# List projects and route metadata
+basic-memory project list
+```
+
+`basic-memory cloud login` / `basic-memory cloud logout` are authentication commands. They do not change default CLI
+routing behavior.
+
+**Routing Flags**:
+
+Use routing flags to disambiguate command targets:
+
+```bash
+# Force local routing for this command
+basic-memory status --local
+basic-memory project list --local
+basic-memory project ls --name main --local
+
+# Force cloud routing for this command
+basic-memory status --cloud
+basic-memory project info my-project --cloud
+basic-memory project ls --name main --cloud
+```
+
+No-flag behavior defaults to local when no project context is present.
+
+The local MCP server routes per transport: `--transport stdio` honors per-project routing
+(local or cloud), while `--transport streamable-http` and `--transport sse` always route locally.
+
+**CLI Note Editing (`tool edit-note`):**
+
+```bash
+# Append content
+basic-memory tool edit-note project-plan --operation append --content $'\n## Next Steps\n- Finalize rollout'
+
+# Find/replace with replacement count validation
+basic-memory tool edit-note docs/api --operation find_replace --find-text "v0.14.0" --content "v0.15.0" --expected-replacements 2
+
+# Replace a section body
+basic-memory tool edit-note docs/setup --operation replace_section --section "## Installation" --content $'Updated install steps\n- Run just install'
+
+# JSON metadata output for integrations
+basic-memory tool edit-note docs/setup --operation append --content $'\n- Added note' --format json
+```
+
+4. In Claude Desktop, the LLM can now use these tools:
+
+**Content Management:**
+```
+write_note(title, content, folder, tags, output_format="text"|"json") - Create or update notes
+read_note(identifier, page, page_size, output_format="text"|"json") - Read notes by title or permalink
+read_content(path) - Read raw file content (text, images, binaries)
+view_note(identifier) - View notes as formatted artifacts
+edit_note(identifier, operation, content, output_format="text"|"json") - Edit notes incrementally
+move_note(identifier, destination_path, output_format="text"|"json") - Move notes with database consistency
+delete_note(identifier, output_format="text"|"json") - Delete notes from knowledge base
+```
+
+**Knowledge Graph Navigation:**
+```
+build_context(url, depth, timeframe, output_format="json"|"text") - Navigate knowledge graph via memory:// URLs
+recent_activity(type, depth, timeframe, output_format="text"|"json") - Find recently updated information
+list_directory(dir_name, depth) - Browse directory contents with filtering
+```
+
+**Search & Discovery:**
+```
 search(query, page, page_size) - Search across your knowledge base
-recent_activity(type, depth, timeframe) - Find recently updated information
+search_notes(query, page, page_size, search_type, types, entity_types, after_date, metadata_filters, tags, status, project) - Search with filters (query is optional for filter-only searches)
+```
+
+**Project Management:**
+```
+list_memory_projects(output_format="text"|"json") - List all available projects
+create_memory_project(project_name, project_path, output_format="text"|"json") - Create new projects
+get_current_project() - Show current project stats
+sync_status() - Check synchronization status
+```
+
+`output_format` defaults to `"text"` for these tools, preserving current human-readable responses.
+`build_context` defaults to `"json"` and can be switched to `"text"` when compact markdown output is preferred.
+
+**Cloud Discovery (opt-in):**
+```
+cloud_info() - Show optional Cloud overview and setup guidance
+release_notes() - Show latest release notes
+```
+
+**Visualization:**
+```
 canvas(nodes, edges, title, folder) - Generate knowledge visualizations
 ```
 
@@ -369,12 +518,147 @@ canvas(nodes, edges, title, folder) - Generate knowledge visualizations
 
 ## Futher info
 
-See the [Documentation](https://memory.basicmachines.co/) for more info, including:
+See the [Documentation](https://docs.basicmemory.com?utm_source=github&utm_medium=referral&utm_campaign=readme) for more info, including:
 
-- [Complete User Guide](https://memory.basicmachines.co/docs/user-guide)
-- [CLI tools](https://memory.basicmachines.co/docs/cli-reference)
-- [Managing multiple Projects](https://memory.basicmachines.co/docs/cli-reference#project)
-- [Importing data from OpenAI/Claude Projects](https://memory.basicmachines.co/docs/cli-reference#import)
+- [Complete User Guide](https://docs.basicmemory.com/user-guide/?utm_source=github&utm_medium=referral&utm_campaign=readme)
+- [CLI tools](https://docs.basicmemory.com/guides/cli-reference/?utm_source=github&utm_medium=referral&utm_campaign=readme)
+- [Cloud CLI and Sync](https://docs.basicmemory.com/guides/cloud-cli/?utm_source=github&utm_medium=referral&utm_campaign=readme)
+- [Managing multiple Projects](https://docs.basicmemory.com/guides/cli-reference/?utm_source=github&utm_medium=referral&utm_campaign=readme#project)
+- [Importing data from OpenAI/Claude Projects](https://docs.basicmemory.com/guides/cli-reference/?utm_source=github&utm_medium=referral&utm_campaign=readme#import)
+
+## Telemetry
+
+Basic Memory collects anonymous, minimal usage events to understand how the CLI-to-cloud conversion funnel performs. This helps us prioritize features and improve the product.
+
+**What we collect:**
+- Cloud promo impressions (when the promo banner is shown)
+- Cloud login attempts and outcomes
+- Promo opt-out events
+
+**What we do NOT collect:**
+- No file contents, note titles, or knowledge base data
+- No personally identifiable information (PII)
+- No IP address tracking or fingerprinting
+- No per-command or per-tool-call tracking
+
+Events are sent to our [Umami Cloud](https://umami.is) instance, an open-source, privacy-focused analytics platform. Events are fire-and-forget on a background thread — analytics never blocks or slows the CLI.
+
+**Opt out** by setting the environment variable:
+
+```bash
+export BASIC_MEMORY_NO_PROMOS=1
+```
+
+This disables both promo messages and all telemetry events.
+
+## Logging
+
+Basic Memory uses [Loguru](https://github.com/Delgan/loguru) for logging. The logging behavior varies by entry point:
+
+| Entry Point | Default Behavior | Use Case |
+|-------------|------------------|----------|
+| CLI commands | File only | Prevents log output from interfering with command output |
+| MCP server | File only | Stdout would corrupt the JSON-RPC protocol |
+| API server | File (local) or stdout (cloud) | Docker/cloud deployments use stdout |
+
+**Log file location:** `~/.basic-memory/basic-memory.log` (10MB rotation, 10 days retention)
+
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BASIC_MEMORY_LOG_LEVEL` | `INFO` | Log level: DEBUG, INFO, WARNING, ERROR |
+| `BASIC_MEMORY_CLOUD_MODE` | `false` | When `true`, API logs to stdout with structured context |
+| `BASIC_MEMORY_FORCE_LOCAL` | `false` | When `true`, forces local API routing |
+| `BASIC_MEMORY_FORCE_CLOUD` | `false` | When `true`, forces cloud API routing |
+| `BASIC_MEMORY_EXPLICIT_ROUTING` | `false` | When `true`, marks route selection as explicit (`--local`/`--cloud`) |
+| `BASIC_MEMORY_ENV` | `dev` | Set to `test` for test mode (stderr only) |
+| `BASIC_MEMORY_NO_PROMOS` | `false` | When `true`, disables cloud promo messages and telemetry |
+
+### Examples
+
+```bash
+# Enable debug logging
+BASIC_MEMORY_LOG_LEVEL=DEBUG basic-memory sync
+
+# View logs
+tail -f ~/.basic-memory/basic-memory.log
+
+# Cloud/Docker mode (stdout logging with structured context)
+BASIC_MEMORY_CLOUD_MODE=true uvicorn basic_memory.api.app:app
+```
+
+## Development
+
+### Running Tests
+
+Basic Memory supports dual database backends (SQLite and Postgres). By default, tests run against SQLite. Set `BASIC_MEMORY_TEST_POSTGRES=1` to run against Postgres (uses testcontainers - Docker required).
+
+**Quick Start:**
+```bash
+# Run all tests against SQLite (default, fast)
+just test-sqlite
+
+# Run all tests against Postgres (uses testcontainers)
+just test-postgres
+
+# Run both SQLite and Postgres tests
+just test
+```
+
+**Available Test Commands:**
+
+- `just test` - Run all tests against both SQLite and Postgres
+- `just test-sqlite` - Run all tests against SQLite (fast, no Docker needed)
+- `just test-postgres` - Run all tests against Postgres (uses testcontainers)
+- `just test-unit-sqlite` - Run unit tests against SQLite
+- `just test-unit-postgres` - Run unit tests against Postgres
+- `just test-int-sqlite` - Run integration tests against SQLite
+- `just test-int-postgres` - Run integration tests against Postgres
+- `just test-windows` - Run Windows-specific tests (auto-skips on other platforms)
+- `just test-benchmark` - Run performance benchmark tests
+- `just testmon` - Run tests impacted by recent changes (pytest-testmon)
+- `just test-smoke` - Run fast MCP end-to-end smoke test
+- `just fast-check` - Run fix/format/typecheck + impacted tests + smoke test
+- `just doctor` - Run local file <-> DB consistency checks with temp config
+
+**Postgres Testing:**
+
+Postgres tests use [testcontainers](https://testcontainers-python.readthedocs.io/) which automatically spins up a Postgres instance in Docker. No manual database setup required - just have Docker running.
+
+**Testmon Note:** When no files have changed, `just testmon` may collect 0 tests. That's expected and means no impacted tests were detected.
+
+**Test Markers:**
+
+Tests use pytest markers for selective execution:
+- `windows` - Windows-specific database optimizations
+- `benchmark` - Performance tests (excluded from default runs)
+- `smoke` - Fast MCP end-to-end smoke tests
+
+**Other Development Commands:**
+```bash
+just install          # Install with dev dependencies
+just lint             # Run linting checks
+just typecheck        # Run type checking
+just typecheck-ty     # Run ty type checking (incremental supplement to pyright)
+just format           # Format code with ruff
+just fast-check       # Fast local loop (fix/format/typecheck + testmon + smoke)
+just doctor           # Local consistency check (temp config)
+just check            # Run all quality checks
+just migration "msg"  # Create database migration
+```
+
+**Type Checking Strategy:**
+- `just typecheck` (Pyright) remains the primary, blocking type checker.
+- `just typecheck-ty` (Astral `ty`) is available as a supplemental checker while rules are adopted incrementally.
+- We recommend running both locally while reducing `ty` diagnostics over time.
+
+**Local Consistency Check:**
+```bash
+basic-memory doctor   # Verifies file <-> database sync in a temp project
+```
+
+See the [justfile](justfile) for the complete list of development commands.
 
 ## License
 
@@ -393,4 +677,4 @@ and submitting PRs.
  </picture>
 </a>
 
-Built with ♥️ by Basic Machines
+Built with ♥️ by [Basic Machines](https://basicmachines.co?utm_source=github&utm_medium=referral&utm_campaign=readme)

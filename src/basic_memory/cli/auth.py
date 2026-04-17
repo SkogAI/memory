@@ -1,9 +1,15 @@
 """WorkOS OAuth Device Authorization for CLI."""
 
+import base64
+import hashlib
 import json
 import os
+import secrets
 import time
 import webbrowser
+from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable
+from typing import AsyncContextManager
 
 import httpx
 from rich.console import Console
@@ -16,21 +22,65 @@ console = Console()
 class CLIAuth:
     """Handles WorkOS OAuth Device Authorization for CLI tools."""
 
-    def __init__(self, client_id: str, authkit_domain: str):
+    def __init__(
+        self,
+        client_id: str,
+        authkit_domain: str,
+        http_client_factory: Callable[[], AsyncContextManager[httpx.AsyncClient]] | None = None,
+    ):
         self.client_id = client_id
         self.authkit_domain = authkit_domain
         app_config = ConfigManager().config
         # Store tokens in data dir
         self.token_file = app_config.data_dir_path / "basic-memory-cloud.json"
+        # PKCE parameters
+        self.code_verifier = None
+        self.code_challenge = None
+        self._http_client_factory = http_client_factory
+
+    @asynccontextmanager
+    async def _get_http_client(self) -> AsyncIterator[httpx.AsyncClient]:
+        """Create an AsyncClient, optionally via injected factory.
+
+        Why: enables reliable tests without monkeypatching httpx internals while
+        still using real httpx request/response objects.
+        """
+        if self._http_client_factory:
+            async with self._http_client_factory() as client:
+                yield client
+        else:
+            async with httpx.AsyncClient() as client:
+                yield client
+
+    def generate_pkce_pair(self) -> tuple[str, str]:
+        """Generate PKCE code verifier and challenge."""
+        # Generate code verifier (43-128 characters)
+        code_verifier = base64.urlsafe_b64encode(secrets.token_bytes(32)).decode("utf-8")
+        code_verifier = code_verifier.rstrip("=")
+
+        # Generate code challenge (SHA256 hash of verifier)
+        challenge_bytes = hashlib.sha256(code_verifier.encode("utf-8")).digest()
+        code_challenge = base64.urlsafe_b64encode(challenge_bytes).decode("utf-8")
+        code_challenge = code_challenge.rstrip("=")
+
+        return code_verifier, code_challenge
 
     async def request_device_authorization(self) -> dict | None:
-        """Request device authorization from WorkOS."""
+        """Request device authorization from WorkOS with PKCE."""
         device_auth_url = f"{self.authkit_domain}/oauth2/device_authorization"
 
-        data = {"client_id": self.client_id, "scope": "openid profile email offline_access"}
+        # Generate PKCE pair
+        self.code_verifier, self.code_challenge = self.generate_pkce_pair()
+
+        data = {
+            "client_id": self.client_id,
+            "scope": "openid profile email offline_access",
+            "code_challenge": self.code_challenge,
+            "code_challenge_method": "S256",
+        }
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with self._get_http_client() as client:
                 response = await client.post(device_auth_url, data=data)
 
                 if response.status_code == 200:
@@ -50,7 +100,7 @@ class CLIAuth:
         verification_uri = device_response["verification_uri"]
         verification_uri_complete = device_response.get("verification_uri_complete")
 
-        console.print("\n[bold blue]🔐 Authentication Required[/bold blue]")
+        console.print("\n[bold blue]Authentication Required[/bold blue]")
         console.print("\nTo authenticate, please visit:")
         console.print(f"[bold cyan]{verification_uri}[/bold cyan]")
         console.print(f"\nAnd enter this code: [bold yellow]{user_code}[/bold yellow]")
@@ -76,6 +126,7 @@ class CLIAuth:
             "client_id": self.client_id,
             "device_code": device_code,
             "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
+            "code_verifier": self.code_verifier,
         }
 
         max_attempts = 60  # 5 minutes with 5-second intervals
@@ -83,7 +134,7 @@ class CLIAuth:
 
         for _attempt in range(max_attempts):
             try:
-                async with httpx.AsyncClient() as client:
+                async with self._get_http_client() as client:
                     response = await client.post(token_url, data=data)
 
                     if response.status_code == 200:
@@ -143,7 +194,7 @@ class CLIAuth:
         # Secure the token file
         os.chmod(self.token_file, 0o600)
 
-        console.print(f"[green]✓ Tokens saved to {self.token_file}[/green]")
+        console.print(f"[green]Tokens saved to {self.token_file}[/green]")
 
     def load_tokens(self) -> dict | None:
         """Load tokens from .bm-auth.json file."""
@@ -173,7 +224,7 @@ class CLIAuth:
         }
 
         try:
-            async with httpx.AsyncClient() as client:
+            async with self._get_http_client() as client:
                 response = await client.post(token_url, data=data)
 
                 if response.status_code == 200:
@@ -205,7 +256,7 @@ class CLIAuth:
             if new_tokens:
                 # Save new tokens (may include rotated refresh token)
                 self.save_tokens(new_tokens)
-                console.print("[green]✓ Token refreshed successfully[/green]")
+                console.print("[green]Token refreshed successfully[/green]")
                 return new_tokens["access_token"]
             else:
                 console.print("[yellow]Token refresh failed. Please run 'login' again.[/yellow]")
@@ -216,7 +267,7 @@ class CLIAuth:
 
     async def login(self) -> bool:
         """Perform OAuth Device Authorization login flow."""
-        console.print("[blue]Initiating WorkOS authentication...[/blue]")
+        console.print("[blue]Initiating authentication...[/blue]")
 
         # Step 1: Request device authorization
         device_response = await self.request_device_authorization()
@@ -237,13 +288,13 @@ class CLIAuth:
         # Step 4: Save tokens
         self.save_tokens(tokens)
 
-        console.print("\n[green]✅ Successfully authenticated with WorkOS![/green]")
+        console.print("\n[green]Successfully authenticated with Basic Memory Cloud![/green]")
         return True
 
     def logout(self) -> None:
         """Remove stored authentication tokens."""
         if self.token_file.exists():
             self.token_file.unlink()
-            console.print("[green]✓ Logged out successfully[/green]")
+            console.print("[green]Logged out successfully[/green]")
         else:
             console.print("[yellow]No stored authentication found[/yellow]")

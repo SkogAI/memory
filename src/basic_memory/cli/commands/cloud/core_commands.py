@@ -1,31 +1,36 @@
 """Core cloud commands for Basic Memory CLI."""
 
-import asyncio
-from pathlib import Path
-from typing import Optional
-
-import httpx
 import typer
 from rich.console import Console
-from rich.table import Table
 
 from basic_memory.cli.app import cloud_app
+from basic_memory.cli.commands.command_utils import run_with_cleanup
 from basic_memory.cli.auth import CLIAuth
+from basic_memory.cli.analytics import (
+    track,
+    EVENT_CLOUD_LOGIN_STARTED,
+    EVENT_CLOUD_LOGIN_SUCCESS,
+    EVENT_CLOUD_LOGIN_SUB_REQUIRED,
+    EVENT_PROMO_OPTED_OUT,
+)
+from basic_memory.cli.promo import OSS_DISCOUNT_CODE
+from basic_memory.config import ConfigManager
 from basic_memory.cli.commands.cloud.api_client import (
     CloudAPIError,
+    SubscriptionRequiredError,
     get_cloud_config,
     make_api_request,
-    get_authenticated_headers,
 )
-from basic_memory.cli.commands.cloud.mount_commands import (
-    mount_cloud_files,
-    setup_cloud_mount,
-    show_mount_status,
-    unmount_cloud_files,
+from basic_memory.cli.commands.cloud.bisync_commands import (
+    BisyncError,
+    generate_mount_credentials,
+    get_mount_info,
 )
-from basic_memory.cli.commands.cloud.rclone_config import MOUNT_PROFILES
-from basic_memory.ignore_utils import load_gitignore_patterns, should_ignore_path
-from basic_memory.utils import generate_permalink
+from basic_memory.cli.commands.cloud.rclone_config import configure_rclone_remote
+from basic_memory.cli.commands.cloud.rclone_installer import (
+    RcloneInstallError,
+    install_rclone,
+)
 
 console = Console()
 
@@ -35,364 +40,242 @@ def login():
     """Authenticate with WorkOS using OAuth Device Authorization flow."""
 
     async def _login():
-        client_id, domain, _ = get_cloud_config()
+        track(EVENT_CLOUD_LOGIN_STARTED)
+        client_id, domain, host_url = get_cloud_config()
         auth = CLIAuth(client_id=client_id, authkit_domain=domain)
 
-        success = await auth.login()
-        if not success:
-            console.print("[red]Login failed[/red]")
+        try:
+            success = await auth.login()
+            if not success:
+                console.print("[red]Login failed[/red]")
+                raise typer.Exit(1)
+
+            # Test subscription access by calling a protected endpoint
+            console.print("[dim]Verifying subscription access...[/dim]")
+            await make_api_request("GET", f"{host_url.rstrip('/')}/proxy/health")
+
+            track(EVENT_CLOUD_LOGIN_SUCCESS)
+            console.print("[green]Cloud authentication successful[/green]")
+            console.print(f"[dim]Cloud host ready: {host_url}[/dim]")
+
+        except SubscriptionRequiredError as e:
+            track(EVENT_CLOUD_LOGIN_SUB_REQUIRED)
+            console.print("\n[red]Subscription Required[/red]\n")
+            console.print(f"[yellow]{e.args[0]}[/yellow]\n")
+            console.print(
+                f"OSS discount code: [bold]{OSS_DISCOUNT_CODE}[/bold] (20% off for 3 months)\n"
+            )
+            console.print(f"Subscribe at: [blue underline]{e.subscribe_url}[/blue underline]\n")
+            console.print(
+                "[dim]Once you have an active subscription, run [bold]bm cloud login[/bold] again.[/dim]"
+            )
             raise typer.Exit(1)
 
-    asyncio.run(_login())
+    run_with_cleanup(_login())
 
 
-# Project commands
-
-project_app = typer.Typer(help="Manage Basic Memory Cloud Projects")
-cloud_app.add_typer(project_app, name="project")
-
-
-@project_app.command("list")
-def list_projects() -> None:
-    """List projects on the cloud instance."""
-
-    try:
-        # Get cloud configuration
-        _, _, host_url = get_cloud_config()
-        host_url = host_url.rstrip("/")
-
-        console.print(f"[blue]Fetching projects from {host_url}...[/blue]")
-
-        # Make API request to list projects
-        response = asyncio.run(
-            make_api_request(method="GET", url=f"{host_url}/proxy/projects/projects")
-        )
-
-        projects_data = response.json()
-
-        if not projects_data.get("projects"):
-            console.print("[yellow]No projects found on the cloud instance.[/yellow]")
-            return
-
-        # Create table for display
-        table = Table(
-            title="Cloud Projects", show_header=True, header_style="bold blue", min_width=60
-        )
-        table.add_column("Name", style="green", min_width=20)
-        table.add_column("Path", style="dim", min_width=30)
-
-        for project in projects_data["projects"]:
-            # Format the path for display
-            path = project.get("path", "")
-            if path.startswith("/"):
-                path = f"~{path}" if path.startswith(str(Path.home())) else path
-
-            table.add_row(
-                project.get("name", "unnamed"),
-                path,
-            )
-
-        console.print(table)
-        console.print(f"\n[green]Found {len(projects_data['projects'])} project(s)[/green]")
-
-    except CloudAPIError as e:
-        console.print(f"[red]Error: {e}[/red]")
-        raise typer.Exit(1)
-    except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-@project_app.command("add")
-def add_project(
-    name: str = typer.Argument(..., help="Name of the project to add"),
-    set_default: bool = typer.Option(False, "--default", "-d", help="Set as default project"),
-) -> None:
-    """Create a new project on the cloud instance."""
-
-    # Get cloud configuration
-    _, _, host_url = get_cloud_config()
-    host_url = host_url.rstrip("/")
-
-    # Prepare headers
-    headers = {"Content-Type": "application/json"}
-
-    project_path = generate_permalink(name)
-    # Prepare project data
-    project_data = {
-        "name": name,
-        "path": project_path,
-        "set_default": set_default,
-    }
-
-    console.print(project_data)
-
-    try:
-        console.print(f"[blue]Creating project '{name}' on {host_url}...[/blue]")
-
-        # Make API request to create project
-        response = asyncio.run(
-            make_api_request(
-                method="POST",
-                url=f"{host_url}/proxy/projects/projects",
-                headers=headers,
-                json_data=project_data,
-            )
-        )
-
-        result = response.json()
-
-        console.print(f"[green]Project '{name}' created successfully![/green]")
-
-        # Display project details
-        if "project" in result:
-            project = result["project"]
-            console.print(f"  Name: {project.get('name', name)}")
-            console.print(f"  Path: {project.get('path', 'unknown')}")
-            if project.get("id"):
-                console.print(f"  ID: {project['id']}")
-
-    except CloudAPIError as e:
-        console.print(f"[red]Error creating project: {e}[/red]")
-        raise typer.Exit(1)
-    except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-@cloud_app.command("upload")
-def upload_files(
-    project: str = typer.Argument(..., help="Project name to upload to"),
-    path_to_files: str = typer.Argument(..., help="Local path to files or directory to upload"),
-    preserve_timestamps: bool = typer.Option(
-        True,
-        "--preserve-timestamps/--no-preserve-timestamps",
-        help="Preserve file modification times",
-    ),
-    respect_gitignore: bool = typer.Option(
-        True,
-        "--respect-gitignore/--no-gitignore",
-        help="Respect .gitignore patterns and skip common development artifacts",
-    ),
-) -> None:
-    """Upload files to a cloud project using WebDAV."""
-
-    # Get cloud configuration
-    _, _, host_url = get_cloud_config()
-    host_url = host_url.rstrip("/")
-
-    # Validate local path
-    local_path = Path(path_to_files).expanduser().resolve()
-    if not local_path.exists():
-        console.print(f"[red]Error: Path '{path_to_files}' does not exist[/red]")
-        raise typer.Exit(1)
-
-    # Prepare headers
-    headers = {}
-
-    try:
-        # Load gitignore patterns (only if enabled)
-        ignore_patterns = load_gitignore_patterns(local_path) if respect_gitignore else set()
-
-        # Collect files to upload
-        files_to_upload = []
-        ignored_count = 0
-
-        if local_path.is_file():
-            # Single file upload - check if it should be ignored
-            if not respect_gitignore or not should_ignore_path(
-                local_path, local_path.parent, ignore_patterns
-            ):
-                files_to_upload.append(local_path)
-            else:
-                ignored_count += 1
-        else:
-            # Recursively collect all files
-            for file_path in local_path.rglob("*"):
-                if file_path.is_file():
-                    if not respect_gitignore or not should_ignore_path(
-                        file_path, local_path, ignore_patterns
-                    ):
-                        files_to_upload.append(file_path)
-                    else:
-                        ignored_count += 1
-
-        # Show summary
-        if ignored_count > 0 and respect_gitignore:
-            console.print(
-                f"[dim]Ignored {ignored_count} file(s) based on .gitignore and default patterns[/dim]"
-            )
-
-        if not files_to_upload:
-            console.print("[yellow]No files found to upload[/yellow]")
-            return
-
-        console.print(
-            f"[blue]Uploading {len(files_to_upload)} file(s) to project '{project}' on {host_url}...[/blue]"
-        )
-
-        # Upload files using WebDAV
-        asyncio.run(
-            _upload_files_webdav(
-                files_to_upload=files_to_upload,
-                local_base_path=local_path,
-                project=project,
-                host_url=host_url,
-                headers=headers,
-                preserve_timestamps=preserve_timestamps,
-            )
-        )
-
-        console.print(f"[green]Successfully uploaded {len(files_to_upload)} file(s)![/green]")
-
-    except CloudAPIError as e:
-        console.print(f"[red]Error uploading files: {e}[/red]")
-        raise typer.Exit(1)
-    except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-async def _upload_files_webdav(
-    files_to_upload: list[Path],
-    local_base_path: Path,
-    project: str,
-    host_url: str,
-    headers: dict,
-    preserve_timestamps: bool,
-) -> None:
-    """Upload files using WebDAV protocol."""
-
-    # Get authentication headers for WebDAV uploads
-    auth_headers = await get_authenticated_headers()
-
-    async with httpx.AsyncClient(timeout=300.0) as client:
-        for file_path in files_to_upload:
-            # Calculate relative path for WebDAV outside try block
-            if local_base_path.is_file():
-                # Single file upload - use just the filename
-                relative_path = file_path.name
-            else:
-                # Directory upload - preserve structure
-                relative_path = file_path.relative_to(local_base_path)
-
-            try:
-                # WebDAV URL
-                webdav_url = f"{host_url}/proxy/{project}/webdav/{relative_path}"
-
-                # Prepare upload headers
-                upload_headers = dict(headers)
-                upload_headers.update(auth_headers)
-
-                # Add timestamp preservation header if requested
-                if preserve_timestamps:
-                    mtime = file_path.stat().st_mtime
-                    upload_headers["X-OC-Mtime"] = str(mtime)
-
-                # Disable compression for WebDAV as well
-                upload_headers.setdefault("Accept-Encoding", "identity")
-
-                # Read file content
-                file_content = file_path.read_bytes()
-
-                # console.print(f"[dim]Uploading {relative_path} to {webdav_url}[/dim]")
-
-                # Upload file
-                response = await client.put(
-                    webdav_url, content=file_content, headers=upload_headers
-                )
-
-                # console.print(f"[dim]WebDAV response status: {response.status_code}[/dim]")
-                response.raise_for_status()
-
-                # Show file upload progress
-                console.print(f"  ✓ {relative_path}")
-
-            except httpx.HTTPError as e:
-                console.print(f"  ✗ {relative_path} - {e}")
-                if hasattr(e, "response") and e.response is not None:  # pyright: ignore [reportAttributeAccessIssue]
-                    response = e.response  # type: ignore
-                    console.print(f"[red]WebDAV Response status: {response.status_code}[/red]")
-                    console.print(f"[red]WebDAV Response headers: {dict(response.headers)}[/red]")
-                raise CloudAPIError(f"Failed to upload {file_path.name}: {e}") from e
+@cloud_app.command()
+def logout():
+    """Remove stored OAuth tokens."""
+    config = ConfigManager().config
+    auth = CLIAuth(client_id=config.cloud_client_id, authkit_domain=config.cloud_domain)
+    auth.logout()
+    console.print("[dim]API key (if configured) remains available for cloud project routing.[/dim]")
 
 
 @cloud_app.command("status")
 def status() -> None:
-    """Check the status of the cloud instance."""
+    """Check cloud authentication and connection status."""
+    config_manager = ConfigManager()
+    config = config_manager.load_config()
+    auth = CLIAuth(client_id=config.cloud_client_id, authkit_domain=config.cloud_domain)
+    tokens = auth.load_tokens()
 
-    # Get cloud configuration
+    console.print("[bold blue]Cloud Status[/bold blue]")
+    console.print(f"  Host: {config.cloud_host}")
+    console.print(
+        f"  API Key: {'[green]configured[/green]' if config.cloud_api_key else '[yellow]not set[/yellow]'}"
+    )
+
+    oauth_status = "[yellow]not logged in[/yellow]"
+    if tokens:
+        if auth.is_token_valid(tokens):
+            oauth_status = "[green]token valid[/green]"
+        else:
+            oauth_status = "[yellow]token expired[/yellow]"
+    console.print(f"  OAuth: {oauth_status}")
+
+    has_credentials = bool(config.cloud_api_key) or tokens is not None
+    if not has_credentials:
+        console.print(
+            "\n[dim]No cloud credentials found. Run: bm cloud login or bm cloud api-key save <key>[/dim]"
+        )
+        return
+
+    # Quick connection check — just verify we can reach the cloud
     _, _, host_url = get_cloud_config()
     host_url = host_url.rstrip("/")
 
-    # Prepare headers
-    headers = {}
-
     try:
-        console.print(f"[blue]Checking status of {host_url}...[/blue]")
-
-        # Make API request to check health
-        response = asyncio.run(
-            make_api_request(method="GET", url=f"{host_url}/proxy/health", headers=headers)
+        run_with_cleanup(make_api_request(method="GET", url=f"{host_url}/proxy/health"))
+        console.print("\n[green]Cloud connected[/green]")
+    except CloudAPIError:
+        console.print("\n[yellow]Cloud not connected[/yellow]")
+        console.print(
+            "[dim]Try re-authenticating with 'bm cloud login' or 'bm cloud api-key save'.[/dim]"
         )
-
-        health_data = response.json()
-
-        console.print("[green]Cloud instance is healthy[/green]")
-
-        # Display status details
-        if "status" in health_data:
-            console.print(f"  Status: {health_data['status']}")
-        if "version" in health_data:
-            console.print(f"  Version: {health_data['version']}")
-        if "timestamp" in health_data:
-            console.print(f"  Timestamp: {health_data['timestamp']}")
-
-    except CloudAPIError as e:
-        console.print(f"[red]Error checking status: {e}[/red]")
-        raise typer.Exit(1)
-    except Exception as e:
-        console.print(f"[red]Unexpected error: {e}[/red]")
-        raise typer.Exit(1)
-
-
-# Mount commands
+    except Exception:
+        console.print("\n[yellow]Cloud not connected[/yellow]")
 
 
 @cloud_app.command("setup")
 def setup() -> None:
-    """Set up local file access with automatic rclone installation and configuration."""
-    setup_cloud_mount()
+    """Set up cloud sync by installing rclone and configuring credentials.
+
+    After setup, use project commands for syncing:
+      bm project add <name> --cloud --local-path ~/projects/<name>
+      bm project bisync --name <name> --resync  # First time
+      bm project bisync --name <name>            # Subsequent syncs
+    """
+    console.print("[bold blue]Basic Memory Cloud Setup[/bold blue]")
+    console.print("Setting up cloud sync with rclone...\n")
+
+    try:
+        # Step 1: Install rclone
+        console.print("[blue]Step 1: Installing rclone...[/blue]")
+        install_rclone()
+
+        # Step 2: Get tenant info
+        console.print("\n[blue]Step 2: Getting tenant information...[/blue]")
+        tenant_info = run_with_cleanup(get_mount_info())
+        console.print(f"[green]Found tenant: {tenant_info.tenant_id}[/green]")
+
+        # Step 3: Generate credentials
+        console.print("\n[blue]Step 3: Generating sync credentials...[/blue]")
+        creds = run_with_cleanup(generate_mount_credentials(tenant_info.tenant_id))
+        console.print("[green]Generated secure credentials[/green]")
+
+        # Step 4: Configure rclone remote
+        console.print("\n[blue]Step 4: Configuring rclone remote...[/blue]")
+        configure_rclone_remote(
+            access_key=creds.access_key,
+            secret_key=creds.secret_key,
+        )
+
+        console.print("\n[bold green]Cloud setup completed successfully![/bold green]")
+        console.print("\n[bold]Next steps:[/bold]")
+        console.print("1. Add a project with local sync path:")
+        console.print("   bm project add research --cloud --local-path ~/Documents/research")
+        console.print("\n   Or configure sync for an existing project:")
+        console.print("   bm project sync-setup research ~/Documents/research")
+        console.print("\n2. Preview the initial sync (recommended):")
+        console.print("   bm project bisync --name research --resync --dry-run")
+        console.print("\n3. If all looks good, run the actual sync:")
+        console.print("   bm project bisync --name research --resync")
+        console.print("\n4. Subsequent syncs (no --resync needed):")
+        console.print("   bm project bisync --name research")
+        console.print(
+            "\n[dim]Tip: Always use --dry-run first to preview changes before syncing[/dim]"
+        )
+
+    except (RcloneInstallError, BisyncError, CloudAPIError) as e:
+        console.print(f"\n[red]Setup failed: {e}[/red]")
+        raise typer.Exit(1)
+    except Exception as e:
+        console.print(f"\n[red]Unexpected error during setup: {e}[/red]")
+        raise typer.Exit(1)
 
 
-@cloud_app.command("mount")
-def mount(
-    profile: str = typer.Option(
-        "balanced", help=f"Mount profile: {', '.join(MOUNT_PROFILES.keys())}"
-    ),
-    path: Optional[str] = typer.Option(
-        None, help="Custom mount path (default: ~/basic-memory-{tenant-id})"
-    ),
+@cloud_app.command("promo")
+def promo(enabled: bool = typer.Option(True, "--on/--off", help="Enable or disable CLI promos.")):
+    """Enable or disable CLI cloud promo messages."""
+    config_manager = ConfigManager()
+    config = config_manager.load_config()
+    config.cloud_promo_opt_out = not enabled
+    config_manager.save_config(config)
+
+    if enabled:
+        console.print("[green]Cloud promo messages enabled[/green]")
+    else:
+        track(EVENT_PROMO_OPTED_OUT)
+        console.print("[yellow]Cloud promo messages disabled[/yellow]")
+
+
+# --- API key management subcommand group ---
+
+api_key_app = typer.Typer(help="Manage cloud API keys")
+cloud_app.add_typer(api_key_app, name="api-key")
+
+
+@api_key_app.command("save")
+def api_key_save(
+    api_key: str = typer.Argument(..., help="API key (bmc_ prefixed) for cloud access"),
 ) -> None:
-    """Mount cloud files locally for editing."""
-    try:
-        mount_cloud_files(profile_name=profile)
-    except Exception as e:
-        console.print(f"[red]Mount failed: {e}[/red]")
+    """Save an existing API key to local config.
+
+    Use when you already have an API key (e.g., from the web app).
+
+    Example:
+      bm cloud api-key save bmc_abc123...
+    """
+    if not api_key.startswith("bmc_"):
+        console.print("[red]Error: API key must start with 'bmc_'[/red]")
         raise typer.Exit(1)
 
+    config_manager = ConfigManager()
+    config = config_manager.load_config()
+    config.cloud_api_key = api_key
+    config_manager.save_config(config)
 
-@cloud_app.command("unmount")
-def unmount() -> None:
-    """Unmount cloud files."""
+    console.print("[green]API key saved[/green]")
+    console.print("[dim]Projects set to cloud mode will use this key for authentication[/dim]")
+    console.print("[dim]Set a project to cloud mode: bm project set-cloud <name>[/dim]")
+
+
+@api_key_app.command("create")
+def api_key_create(
+    name: str = typer.Argument(..., help="Human-readable name for the API key"),
+) -> None:
+    """Create a new API key via the cloud API and save it locally.
+
+    Requires active OAuth session (run 'bm cloud login' first).
+
+    Example:
+      bm cloud api-key create "my-laptop"
+    """
+
+    async def _create_key():
+        _, _, host_url = get_cloud_config()
+        host_url = host_url.rstrip("/")
+
+        console.print(f"[dim]Creating API key '{name}'...[/dim]")
+        response = await make_api_request(
+            method="POST",
+            url=f"{host_url}/api/keys",
+            json_data={"name": name},
+        )
+
+        key_data = response.json()
+        api_key = key_data.get("key")
+        if not api_key:
+            console.print("[red]Error: No key returned from API[/red]")
+            raise typer.Exit(1)
+
+        # Save to config
+        config_manager = ConfigManager()
+        config = config_manager.load_config()
+        config.cloud_api_key = api_key
+        config_manager.save_config(config)
+
+        console.print(f"[green]API key '{name}' created and saved[/green]")
+        console.print("[dim]Projects set to cloud mode will use this key for authentication[/dim]")
+        console.print("[dim]Set a project to cloud mode: bm project set-cloud <name>[/dim]")
+
     try:
-        unmount_cloud_files()
-    except Exception as e:
-        console.print(f"[red]Unmount failed: {e}[/red]")
+        run_with_cleanup(_create_key())
+    except CloudAPIError as e:
+        console.print(f"[red]Error creating API key: {e}[/red]")
         raise typer.Exit(1)
-
-
-@cloud_app.command("mount-status")
-def mount_status() -> None:
-    """Show current mount status."""
-    show_mount_status()
+    except Exception as e:
+        console.print(f"[red]Unexpected error: {e}[/red]")
+        raise typer.Exit(1)

@@ -5,16 +5,21 @@ import os
 from collections import defaultdict
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional, Set, Sequence
+from typing import List, Optional, Set, Sequence, Callable, Awaitable, TYPE_CHECKING
 
-from basic_memory.config import BasicMemoryConfig, WATCH_STATUS_JSON
+if TYPE_CHECKING:
+    from basic_memory.sync.sync_service import SyncService
+
+from basic_memory.config import BasicMemoryConfig, ProjectMode, WATCH_STATUS_JSON
+from basic_memory.ignore_utils import load_gitignore_patterns, should_ignore_path
 from basic_memory.models import Project
 from basic_memory.repository import ProjectRepository
 from loguru import logger
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from rich.console import Console
 from watchfiles import awatch
 from watchfiles.main import FileChange, Change
+import time
 
 
 class WatchEvent(BaseModel):
@@ -29,8 +34,8 @@ class WatchEvent(BaseModel):
 class WatchServiceState(BaseModel):
     # Service status
     running: bool = False
-    start_time: datetime = datetime.now()  # Use directly with Pydantic model
-    pid: int = os.getpid()  # Use directly with Pydantic model
+    start_time: datetime = Field(default_factory=datetime.now)
+    pid: int = Field(default_factory=os.getpid)
 
     # Stats
     error_count: int = 0
@@ -41,7 +46,7 @@ class WatchServiceState(BaseModel):
     synced_files: int = 0
 
     # Recent activity
-    recent_events: List[WatchEvent] = []  # Use directly with Pydantic model
+    recent_events: List[WatchEvent] = Field(default_factory=list)
 
     def add_event(
         self,
@@ -69,26 +74,48 @@ class WatchServiceState(BaseModel):
         self.last_error = datetime.now()
 
 
+# Type alias for sync service factory function
+SyncServiceFactory = Callable[[Project], Awaitable["SyncService"]]
+
+
 class WatchService:
     def __init__(
         self,
         app_config: BasicMemoryConfig,
         project_repository: ProjectRepository,
         quiet: bool = False,
+        sync_service_factory: Optional[SyncServiceFactory] = None,
     ):
         self.app_config = app_config
         self.project_repository = project_repository
         self.state = WatchServiceState()
-        self.status_path = Path.home() / ".basic-memory" / WATCH_STATUS_JSON
+        self.status_path = app_config.data_dir_path / WATCH_STATUS_JSON
         self.status_path.parent.mkdir(parents=True, exist_ok=True)
+        self._ignore_patterns_cache: dict[Path, Set[str]] = {}
+        self._sync_service_factory = sync_service_factory
 
         # quiet mode for mcp so it doesn't mess up stdout
         self.console = Console(quiet=quiet)
+
+    async def _get_sync_service(self, project: Project) -> "SyncService":
+        """Get sync service for a project, using factory if provided."""
+        if self._sync_service_factory:
+            return await self._sync_service_factory(project)
+        # Fall back to default factory
+        from basic_memory.sync.sync_service import get_sync_service
+
+        return await get_sync_service(project)
 
     async def _schedule_restart(self, stop_event: asyncio.Event):
         """Schedule a restart of the watch service after the configured interval."""
         await asyncio.sleep(self.app_config.watch_project_reload_interval)
         stop_event.set()
+
+    def _get_ignore_patterns(self, project_path: Path) -> Set[str]:
+        """Get or load ignore patterns for a project path."""
+        if project_path not in self._ignore_patterns_cache:
+            self._ignore_patterns_cache[project_path] = load_gitignore_patterns(project_path)
+        return self._ignore_patterns_cache[project_path]
 
     async def _watch_projects_cycle(self, projects: Sequence[Project], stop_event: asyncio.Event):
         """Run one cycle of watching the given projects until stop_event is set."""
@@ -101,17 +128,28 @@ class WatchService:
             recursive=True,
             stop_event=stop_event,
         ):
-            # group changes by project
+            # group changes by project and filter using ignore patterns
             project_changes = defaultdict(list)
             for change, path in changes:
                 for project in projects:
                     if self.is_project_path(project, path):
+                        # Check if the file should be ignored based on gitignore patterns
+                        project_path = Path(project.path)
+                        file_path = Path(path)
+                        ignore_patterns = self._get_ignore_patterns(project_path)
+
+                        if should_ignore_path(file_path, project_path, ignore_patterns):
+                            logger.trace(
+                                f"Ignoring watched file change: {file_path.relative_to(project_path)}"
+                            )
+                            continue
+
                         project_changes[project].append((change, path))
                         break
 
             # create coroutines to handle changes
             change_handlers = [
-                self.handle_changes(project, changes)  # pyright: ignore
+                self.handle_changes(project, set(changes))
                 for project, changes in project_changes.items()
             ]
 
@@ -133,8 +171,26 @@ class WatchService:
 
         try:
             while self.state.running:
+                # Clear ignore patterns cache to pick up any .gitignore changes
+                self._ignore_patterns_cache.clear()
+
                 # Reload projects to catch any new/removed projects
                 projects = await self.project_repository.get_active_projects()
+
+                # Trigger: project is configured for cloud routing
+                # Why: cloud-only projects (no local directory) should not be watched;
+                #       cloud projects with a local bisync copy (absolute path) need watching
+                # Outcome: watch cycle skips cloud projects without a local directory
+                cloud_skip = []
+                for p in projects:
+                    if self.app_config.get_project_mode(p.name) == ProjectMode.CLOUD:
+                        entry = self.app_config.projects.get(p.name)
+                        if entry and Path(entry.path).is_absolute():
+                            continue  # Cloud project with local bisync copy — keep watching
+                        cloud_skip.append(p.name)
+                if cloud_skip:
+                    projects = [p for p in projects if p.name not in cloud_skip]
+                    logger.debug(f"Skipping cloud-mode projects in watch cycle: {cloud_skip}")
 
                 project_paths = [project.path for project in projects]
                 logger.debug(f"Starting watch cycle for directories: {project_paths}")
@@ -210,13 +266,21 @@ class WatchService:
 
     async def handle_changes(self, project: Project, changes: Set[FileChange]) -> None:
         """Process a batch of file changes"""
-        import time
-        from typing import List, Set
+        # Check if project still exists in configuration before processing
+        # This prevents deleted projects from being recreated by background sync
+        from basic_memory.config import ConfigManager
 
-        # Lazily initialize sync service for project changes
-        from basic_memory.cli.commands.sync import get_sync_service
+        config_manager = ConfigManager()
+        if (
+            project.name not in config_manager.projects
+            and project.permalink not in config_manager.projects
+        ):
+            logger.info(
+                f"Skipping sync for deleted project: {project.name}, change_count={len(changes)}"
+            )
+            return
 
-        sync_service = await get_sync_service(project)
+        sync_service = await self._get_sync_service(project)
         file_service = sync_service.file_service
 
         start_time = time.time()
@@ -250,12 +314,17 @@ class WatchService:
         )
 
         # because of our atomic writes on updates, an add may be an existing file
-        for added_path in adds:  # pragma: no cover TODO add test
+        # Avoid mutating `adds` while iterating (can skip items).
+        reclassified_as_modified: List[str] = []
+        for added_path in list(adds):  # pragma: no cover TODO add test
             entity = await sync_service.entity_repository.get_by_file_path(added_path)
             if entity is not None:
                 logger.debug(f"Existing file will be processed as modified, path={added_path}")
-                adds.remove(added_path)
-                modifies.append(added_path)
+                reclassified_as_modified.append(added_path)
+
+        if reclassified_as_modified:
+            adds = [p for p in adds if p not in reclassified_as_modified]
+            modifies.extend(reclassified_as_modified)
 
         # Track processed files to avoid duplicates
         processed: Set[str] = set()
@@ -433,19 +502,19 @@ class WatchService:
 
         # Add a concise summary instead of a divider
         if processed:
-            changes = []  # pyright: ignore
+            change_summary: list[str] = []
             if add_count > 0:
-                changes.append(f"[green]{add_count} added[/green]")  # pyright: ignore
+                change_summary.append(f"[green]{add_count} added[/green]")
             if modify_count > 0:
-                changes.append(f"[yellow]{modify_count} modified[/yellow]")  # pyright: ignore
+                change_summary.append(f"[yellow]{modify_count} modified[/yellow]")
             if moved_count > 0:
-                changes.append(f"[blue]{moved_count} moved[/blue]")  # pyright: ignore
+                change_summary.append(f"[blue]{moved_count} moved[/blue]")
             if delete_count > 0:
-                changes.append(f"[red]{delete_count} deleted[/red]")  # pyright: ignore
+                change_summary.append(f"[red]{delete_count} deleted[/red]")
 
-            if changes:
-                self.console.print(f"{', '.join(changes)}", style="dim")  # pyright: ignore
-                logger.info(f"changes: {len(changes)}")
+            if change_summary:
+                self.console.print(f"{', '.join(change_summary)}", style="dim")
+                logger.info(f"changes: {len(change_summary)}")
 
         duration_ms = int((time.time() - start_time) * 1000)
         self.state.last_scan = datetime.now()

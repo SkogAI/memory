@@ -1,7 +1,16 @@
-"""Tests for watch service project reloading functionality."""
+"""Tests for watch service project reloading functionality (minimal mocking).
+
+We avoid standard-library mocks in favor of:
+- small stub repo/task objects
+- pytest monkeypatch for swapping asyncio.sleep / watchfiles.awatch when needed
+"""
+
+from __future__ import annotations
 
 import asyncio
-from unittest.mock import AsyncMock, patch
+from dataclasses import dataclass
+from typing import Any, cast
+
 import pytest
 
 from basic_memory.config import BasicMemoryConfig
@@ -9,244 +18,329 @@ from basic_memory.models.project import Project
 from basic_memory.sync.watch_service import WatchService
 
 
+@dataclass
+class _Repo:
+    projects_side_effect: list[list[Project]] | None = None
+    projects_return: list[Project] | None = None
+
+    def __post_init__(self):
+        self.calls = 0
+
+    async def get_active_projects(self):
+        self.calls += 1
+        if self.projects_side_effect is not None:
+            idx = min(self.calls - 1, len(self.projects_side_effect) - 1)
+            return self.projects_side_effect[idx]
+        return self.projects_return or []
+
+
+def _watch_service(config: BasicMemoryConfig, repo: _Repo) -> WatchService:
+    return WatchService(config, cast(Any, repo), quiet=True)
+
+
 @pytest.mark.asyncio
-async def test_schedule_restart_uses_config_interval():
-    """Test that _schedule_restart uses the configured interval."""
+async def test_schedule_restart_uses_config_interval(monkeypatch):
     config = BasicMemoryConfig(watch_project_reload_interval=2)
-    repo = AsyncMock()
-    watch_service = WatchService(config, repo, quiet=True)
+    repo = _Repo()
+    watch_service = _watch_service(config, repo)
 
     stop_event = asyncio.Event()
+    slept: list[int] = []
 
-    # Mock sleep to capture the interval
-    with patch("asyncio.sleep") as mock_sleep:
-        mock_sleep.return_value = None  # Make it return immediately
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        return None
 
-        await watch_service._schedule_restart(stop_event)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
 
-        # Verify sleep was called with config interval
-        mock_sleep.assert_called_once_with(2)
+    await watch_service._schedule_restart(stop_event)
 
-        # Verify stop event was set
-        assert stop_event.is_set()
+    assert slept == [2]
+    assert stop_event.is_set()
 
 
 @pytest.mark.asyncio
-async def test_watch_projects_cycle_handles_empty_project_list():
-    """Test that _watch_projects_cycle handles empty project list."""
+async def test_watch_projects_cycle_handles_empty_project_list(monkeypatch):
     config = BasicMemoryConfig()
-    repo = AsyncMock()
-    watch_service = WatchService(config, repo, quiet=True)
+    repo = _Repo()
+    watch_service = _watch_service(config, repo)
 
     stop_event = asyncio.Event()
-    stop_event.set()  # Set immediately to exit quickly
+    stop_event.set()
 
-    # Mock awatch to track calls
-    with patch("basic_memory.sync.watch_service.awatch") as mock_awatch:
-        # Create an async iterator that yields nothing
-        async def empty_iterator():
-            return
-            yield  # unreachable, just for async generator
+    captured: dict[str, Any] = {"args": None, "kwargs": None}
 
-        mock_awatch.return_value = empty_iterator()
+    async def awatch_stub(*args, **kwargs):
+        captured["args"] = args
+        captured["kwargs"] = kwargs
+        if False:  # pragma: no cover
+            yield None
+        return
 
-        # Should not raise error with empty project list
-        await watch_service._watch_projects_cycle([], stop_event)
+    monkeypatch.setattr("basic_memory.sync.watch_service.awatch", awatch_stub)
 
-        # awatch should be called with no paths
-        mock_awatch.assert_called_once_with(
-            debounce=config.sync_delay,
-            watch_filter=watch_service.filter_changes,
-            recursive=True,
-            stop_event=stop_event,
-        )
+    await watch_service._watch_projects_cycle([], stop_event)
 
-
-@pytest.mark.asyncio
-async def test_run_handles_no_projects():
-    """Test that run method handles no active projects gracefully."""
-    config = BasicMemoryConfig()
-    repo = AsyncMock()
-    repo.get_active_projects.return_value = []  # No projects
-
-    watch_service = WatchService(config, repo, quiet=True)
-
-    call_count = 0
-
-    def stop_after_one_call(*args):
-        nonlocal call_count
-        call_count += 1
-        if call_count >= 1:
-            watch_service.state.running = False
-        return AsyncMock()
-
-    # Mock sleep and write_status to track behavior
-    with patch("asyncio.sleep", side_effect=stop_after_one_call) as mock_sleep:
-        with patch.object(watch_service, "write_status", return_value=None):
-            await watch_service.run()
-
-    # Should have slept for 30 seconds when no projects found
-    mock_sleep.assert_called_with(30)
+    kwargs = captured["kwargs"]
+    assert isinstance(kwargs, dict)
+    assert captured["args"] == ()
+    assert kwargs["debounce"] == config.sync_delay
+    assert kwargs["watch_filter"] == watch_service.filter_changes
+    assert kwargs["recursive"] is True
+    assert kwargs["stop_event"] is stop_event
 
 
 @pytest.mark.asyncio
-async def test_run_reloads_projects_each_cycle():
-    """Test that run method reloads projects in each cycle."""
+async def test_run_handles_no_projects(monkeypatch):
     config = BasicMemoryConfig()
-    repo = AsyncMock()
+    repo = _Repo(projects_return=[])
+    watch_service = _watch_service(config, repo)
 
-    # Return different projects on each call
-    projects_call_1 = [Project(id=1, name="project1", path="/tmp/project1", permalink="project1")]
-    projects_call_2 = [
-        Project(id=1, name="project1", path="/tmp/project1", permalink="project1"),
-        Project(id=2, name="project2", path="/tmp/project2", permalink="project2"),
-    ]
+    slept: list[int] = []
 
-    repo.get_active_projects.side_effect = [projects_call_1, projects_call_2]
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        # Stop after first sleep
+        watch_service.state.running = False
+        return None
 
-    watch_service = WatchService(config, repo, quiet=True)
+    async def fake_write_status():
+        return None
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(watch_service, "write_status", fake_write_status)
+
+    await watch_service.run()
+
+    assert slept and slept[-1] == config.watch_project_reload_interval
+
+
+@pytest.mark.asyncio
+async def test_run_reloads_projects_each_cycle(monkeypatch, tmp_path):
+    config = BasicMemoryConfig(watch_project_reload_interval=1)
+    repo = _Repo(
+        projects_side_effect=[
+            [Project(id=1, name="project1", path=str(tmp_path / "p1"), permalink="project1")],
+            [
+                Project(id=1, name="project1", path=str(tmp_path / "p1"), permalink="project1"),
+                Project(id=2, name="project2", path=str(tmp_path / "p2"), permalink="project2"),
+            ],
+        ]
+    )
+    watch_service = _watch_service(config, repo)
 
     cycle_count = 0
 
-    async def mock_watch_cycle(projects, stop_event):
+    async def watch_cycle_stub(projects, stop_event):
         nonlocal cycle_count
         cycle_count += 1
         if cycle_count >= 2:
             watch_service.state.running = False
+        stop_event.set()
 
-    with patch.object(watch_service, "_watch_projects_cycle", side_effect=mock_watch_cycle):
-        with patch.object(watch_service, "write_status", return_value=None):
-            await watch_service.run()
+    async def fake_write_status():
+        return None
 
-    # Should have reloaded projects twice
-    assert repo.get_active_projects.call_count == 2
+    monkeypatch.setattr(watch_service, "_watch_projects_cycle", watch_cycle_stub)
+    monkeypatch.setattr(watch_service, "write_status", fake_write_status)
 
-    # Should have completed two cycles
+    await watch_service.run()
+
+    assert repo.calls == 2
     assert cycle_count == 2
 
 
 @pytest.mark.asyncio
-async def test_run_continues_after_cycle_error():
-    """Test that run continues to next cycle after error in watch cycle."""
-    config = BasicMemoryConfig()
-    repo = AsyncMock()
-    repo.get_active_projects.return_value = [
-        Project(id=1, name="test", path="/tmp/test", permalink="test")
-    ]
+async def test_run_filters_cloud_only_projects_each_cycle(monkeypatch, tmp_path):
+    """Cloud-only projects (slug path, no local directory) are filtered out."""
+    config = BasicMemoryConfig(
+        watch_project_reload_interval=1,
+        projects={
+            "local-project": {"path": str(tmp_path / "local"), "mode": "local"},
+            "cloud-only": {"path": "cloud-slug", "mode": "cloud"},
+        },
+    )
+    repo = _Repo(
+        projects_return=[
+            Project(id=1, name="local-project", path=str(tmp_path / "local"), permalink="local"),
+            Project(id=2, name="cloud-only", path="cloud-slug", permalink="cloud-only"),
+        ]
+    )
+    watch_service = _watch_service(config, repo)
 
-    watch_service = WatchService(config, repo, quiet=True)
+    seen_project_names: list[list[str]] = []
+
+    async def watch_cycle_stub(projects, stop_event):
+        seen_project_names.append([p.name for p in projects])
+        watch_service.state.running = False
+        stop_event.set()
+
+    async def fake_write_status():
+        return None
+
+    monkeypatch.setattr(watch_service, "_watch_projects_cycle", watch_cycle_stub)
+    monkeypatch.setattr(watch_service, "write_status", fake_write_status)
+
+    await watch_service.run()
+
+    assert seen_project_names == [["local-project"]]
+
+
+@pytest.mark.asyncio
+async def test_run_keeps_cloud_projects_with_local_bisync(monkeypatch, tmp_path):
+    """Cloud projects with an absolute path (local bisync copy) are kept for watching."""
+    config = BasicMemoryConfig(
+        watch_project_reload_interval=1,
+        projects={
+            "local-project": {"path": str(tmp_path / "local"), "mode": "local"},
+            "cloud-bisync": {"path": str(tmp_path / "cloud"), "mode": "cloud"},
+        },
+    )
+    repo = _Repo(
+        projects_return=[
+            Project(id=1, name="local-project", path=str(tmp_path / "local"), permalink="local"),
+            Project(
+                id=2,
+                name="cloud-bisync",
+                path=str(tmp_path / "cloud"),
+                permalink="cloud-bisync",
+            ),
+        ]
+    )
+    watch_service = _watch_service(config, repo)
+
+    seen_project_names: list[list[str]] = []
+
+    async def watch_cycle_stub(projects, stop_event):
+        seen_project_names.append([p.name for p in projects])
+        watch_service.state.running = False
+        stop_event.set()
+
+    async def fake_write_status():
+        return None
+
+    monkeypatch.setattr(watch_service, "_watch_projects_cycle", watch_cycle_stub)
+    monkeypatch.setattr(watch_service, "write_status", fake_write_status)
+
+    await watch_service.run()
+
+    assert seen_project_names == [["local-project", "cloud-bisync"]]
+
+
+@pytest.mark.asyncio
+async def test_run_continues_after_cycle_error(monkeypatch, tmp_path):
+    config = BasicMemoryConfig()
+    repo = _Repo(
+        projects_return=[Project(id=1, name="test", path=str(tmp_path / "test"), permalink="test")]
+    )
+    watch_service = _watch_service(config, repo)
 
     call_count = 0
+    slept: list[int] = []
 
-    async def failing_watch_cycle(projects, stop_event):
+    async def failing_watch_cycle(_projects, _stop_event):
         nonlocal call_count
         call_count += 1
         if call_count == 1:
             raise Exception("Simulated error")
-        else:
-            # Stop after second call
-            watch_service.state.running = False
+        watch_service.state.running = False
 
-    with patch.object(watch_service, "_watch_projects_cycle", side_effect=failing_watch_cycle):
-        with patch("asyncio.sleep") as mock_sleep:
-            with patch.object(watch_service, "write_status", return_value=None):
-                await watch_service.run()
+    async def fake_sleep(seconds):
+        slept.append(seconds)
+        return None
 
-    # Should have tried both cycles
+    async def fake_write_status():
+        return None
+
+    monkeypatch.setattr(watch_service, "_watch_projects_cycle", failing_watch_cycle)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    monkeypatch.setattr(watch_service, "write_status", fake_write_status)
+
+    await watch_service.run()
+
     assert call_count == 2
-
-    # Should have slept for error retry
-    mock_sleep.assert_called_with(5)
+    assert 5 in slept  # error backoff
 
 
 @pytest.mark.asyncio
-async def test_timer_task_cancelled_properly():
-    """Test that timer task is cancelled when cycle completes."""
+async def test_timer_task_cancelled_properly(monkeypatch, tmp_path):
     config = BasicMemoryConfig()
-    repo = AsyncMock()
-    repo.get_active_projects.return_value = [
-        Project(id=1, name="test", path="/tmp/test", permalink="test")
-    ]
+    repo = _Repo(
+        projects_return=[Project(id=1, name="test", path=str(tmp_path / "test"), permalink="test")]
+    )
+    watch_service = _watch_service(config, repo)
 
-    watch_service = WatchService(config, repo, quiet=True)
-
-    # Track created timer tasks
-    created_tasks = []
-    original_create_task = asyncio.create_task
+    created_tasks: list[asyncio.Task] = []
+    real_create_task = asyncio.create_task
 
     def track_create_task(coro):
-        task = original_create_task(coro)
+        task = real_create_task(coro)
         created_tasks.append(task)
         return task
 
-    async def quick_watch_cycle(projects, stop_event):
-        # Complete immediately
+    # Make _schedule_restart never complete unless cancelled.
+    async def long_sleep(_seconds):
+        fut = asyncio.Future()
+        return await fut
+
+    async def quick_watch_cycle(_projects, _stop_event):
         watch_service.state.running = False
 
-    with patch("asyncio.create_task", side_effect=track_create_task):
-        with patch.object(watch_service, "_watch_projects_cycle", side_effect=quick_watch_cycle):
-            with patch.object(watch_service, "write_status", return_value=None):
-                await watch_service.run()
+    async def fake_write_status():
+        return None
 
-    # Should have created one timer task
+    monkeypatch.setattr(asyncio, "create_task", track_create_task)
+    monkeypatch.setattr(asyncio, "sleep", long_sleep)
+    monkeypatch.setattr(watch_service, "_watch_projects_cycle", quick_watch_cycle)
+    monkeypatch.setattr(watch_service, "write_status", fake_write_status)
+
+    await watch_service.run()
+
     assert len(created_tasks) == 1
-
-    # Timer task should be cancelled or done
     timer_task = created_tasks[0]
     assert timer_task.cancelled() or timer_task.done()
 
 
 @pytest.mark.asyncio
-async def test_new_project_addition_scenario():
-    """Test the main scenario: new project is detected when added while watching."""
-    config = BasicMemoryConfig()
-    repo = AsyncMock()
+async def test_new_project_addition_scenario(monkeypatch, tmp_path):
+    config = BasicMemoryConfig(
+        projects={
+            "existing": {"path": str(tmp_path / "existing"), "mode": "local"},
+            "new": {"path": str(tmp_path / "new"), "mode": "local"},
+        },
+    )
 
-    # Initially one project
-    initial_projects = [Project(id=1, name="existing", path="/tmp/existing", permalink="existing")]
-
-    # After some time, new project is added
+    initial_projects = [
+        Project(id=1, name="existing", path=str(tmp_path / "existing"), permalink="existing")
+    ]
     updated_projects = [
-        Project(id=1, name="existing", path="/tmp/existing", permalink="existing"),
-        Project(id=2, name="new", path="/tmp/new", permalink="new"),
+        Project(id=1, name="existing", path=str(tmp_path / "existing"), permalink="existing"),
+        Project(id=2, name="new", path=str(tmp_path / "new"), permalink="new"),
     ]
 
-    # Track which project lists were used
-    project_lists_used = []
-
-    def mock_get_projects():
-        if len(project_lists_used) < 2:
-            project_lists_used.append(initial_projects)
-            return initial_projects
-        else:
-            project_lists_used.append(updated_projects)
-            return updated_projects
-
-    repo.get_active_projects.side_effect = mock_get_projects
-
-    watch_service = WatchService(config, repo, quiet=True)
+    repo = _Repo(projects_side_effect=[initial_projects, initial_projects, updated_projects])
+    watch_service = _watch_service(config, repo)
 
     cycle_count = 0
+    project_lists_used: list[list[Project]] = []
 
     async def counting_watch_cycle(projects, stop_event):
         nonlocal cycle_count
         cycle_count += 1
-
-        # Stop after enough cycles to test project reload
+        project_lists_used.append(list(projects))
         if cycle_count >= 3:
             watch_service.state.running = False
+        stop_event.set()
 
-    with patch.object(watch_service, "_watch_projects_cycle", side_effect=counting_watch_cycle):
-        with patch.object(watch_service, "write_status", return_value=None):
-            await watch_service.run()
+    async def fake_write_status():
+        return None
 
-    # Should have reloaded projects multiple times
-    assert repo.get_active_projects.call_count >= 3
+    monkeypatch.setattr(watch_service, "_watch_projects_cycle", counting_watch_cycle)
+    monkeypatch.setattr(watch_service, "write_status", fake_write_status)
 
-    # Should have completed multiple cycles
+    await watch_service.run()
+
+    assert repo.calls >= 3
     assert cycle_count == 3
-
-    # Should have seen both project configurations
-    assert len(project_lists_used) >= 3
-    assert any(len(projects) == 1 for projects in project_lists_used)  # Initial state
-    assert any(len(projects) == 2 for projects in project_lists_used)  # After addition
+    assert any(len(p) == 1 for p in project_lists_used)
+    assert any(len(p) == 2 for p in project_lists_used)

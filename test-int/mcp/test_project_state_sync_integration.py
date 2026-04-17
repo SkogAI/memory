@@ -16,7 +16,7 @@ from fastmcp import Client
 
 @pytest.mark.asyncio
 async def test_project_state_sync_after_default_change(
-    mcp_server, app, config_manager, test_project
+    mcp_server, app, config_manager, test_project, tmp_path
 ):
     """Test that MCP session stays in sync when default project is changed."""
 
@@ -26,7 +26,7 @@ async def test_project_state_sync_after_default_change(
             "create_memory_project",
             {
                 "project_name": "minerva",
-                "project_path": "/tmp/minerva-test-project",
+                "project_path": str(tmp_path.parent / (tmp_path.name + "-projects") / "minerva"),
                 "set_default": False,  # Don't set as default yet
             },
         )
@@ -41,7 +41,7 @@ async def test_project_state_sync_after_default_change(
             {
                 "project": "minerva",
                 "title": "Test Consistency Note",
-                "folder": "test",
+                "directory": "test",
                 "content": "# Test Note\n\nThis note tests project state consistency.\n\n- [test] Project state sync working",
                 "tags": "test,consistency",
             },

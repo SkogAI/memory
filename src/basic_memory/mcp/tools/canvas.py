@@ -4,26 +4,29 @@ This tool creates Obsidian canvas files (.canvas) using the JSON Canvas 1.0 spec
 """
 
 import json
-from typing import Dict, List, Any, Optional
+from typing import Annotated, Dict, List, Any, Optional
 
 from loguru import logger
 from fastmcp import Context
+from pydantic import BeforeValidator
 
-from basic_memory.mcp.async_client import client
-from basic_memory.mcp.project_context import get_active_project
+from basic_memory.mcp.project_context import get_project_client
+from basic_memory.utils import coerce_list
 from basic_memory.mcp.server import mcp
-from basic_memory.mcp.tools.utils import call_put
+from basic_memory.mcp.tools.utils import call_put, call_post, resolve_entity_id
 
 
 @mcp.tool(
     description="Create an Obsidian canvas file to visualize concepts and connections.",
+    annotations={"destructiveHint": False, "idempotentHint": True, "openWorldHint": False},
 )
 async def canvas(
-    nodes: List[Dict[str, Any]],
-    edges: List[Dict[str, Any]],
+    nodes: Annotated[List[Dict[str, Any]], BeforeValidator(coerce_list)],
+    edges: Annotated[List[Dict[str, Any]], BeforeValidator(coerce_list)],
     title: str,
-    folder: str,
+    directory: str,
     project: Optional[str] = None,
+    workspace: Optional[str] = None,
     context: Context | None = None,
 ) -> str:
     """Create an Obsidian canvas file with the provided nodes and edges.
@@ -43,8 +46,8 @@ async def canvas(
         nodes: List of node objects following JSON Canvas 1.0 spec
         edges: List of edge objects following JSON Canvas 1.0 spec
         title: The title of the canvas (will be saved as title.canvas)
-        folder: Folder path relative to project root where the canvas should be saved.
-                Use forward slashes (/) as separators. Examples: "diagrams", "projects/2025", "visual/maps"
+        directory: Directory path relative to project root where the canvas should be saved.
+                   Use forward slashes (/) as separators. Examples: "diagrams", "projects/2025", "visual/maps"
         context: Optional FastMCP context for performance caching.
 
     Returns:
@@ -52,7 +55,7 @@ async def canvas(
 
     Important Notes:
     - When referencing files, use the exact file path as shown in Obsidian
-      Example: "folder/Document Name.md" (not permalink format)
+      Example: "docs/Document Name.md" (not permalink format)
     - For file nodes, the "file" attribute must reference an existing file
     - Nodes require id, type, x, y, width, height properties
     - Edges require id, fromNode, toNode properties
@@ -66,7 +69,7 @@ async def canvas(
         {
           "id": "node1",
           "type": "file",  // Options: "file", "text", "link", "group"
-          "file": "folder/Document.md",
+          "file": "docs/Document.md",
           "x": 0,
           "y": 0,
           "width": 400,
@@ -85,38 +88,66 @@ async def canvas(
     ```
 
     Examples:
-        # Create canvas in project
-        canvas("my-project", nodes=[...], edges=[...], title="My Canvas", folder="diagrams")
+        # Create canvas in default/current project
+        canvas(nodes=[...], edges=[...], title="My Canvas", directory="diagrams")
 
-        # Create canvas in work project
-        canvas("work-project", nodes=[...], edges=[...], title="Process Flow", folder="visual/maps")
+        # Create canvas with explicit project
+        canvas(nodes=[...], edges=[...], title="Process Flow", directory="visual/maps", project="work-project")
 
     Raises:
-        ToolError: If project doesn't exist or folder path is invalid
+        ToolError: If project doesn't exist or directory path is invalid
     """
-    active_project = await get_active_project(client, project, context)
-    project_url = active_project.project_url
+    async with get_project_client(project, workspace, context) as (client, active_project):
+        # Ensure path has .canvas extension
+        file_title = title if title.endswith(".canvas") else f"{title}.canvas"
+        file_path = f"{directory}/{file_title}"
 
-    # Ensure path has .canvas extension
-    file_title = title if title.endswith(".canvas") else f"{title}.canvas"
-    file_path = f"{folder}/{file_title}"
+        # Create canvas data structure
+        canvas_data = {"nodes": nodes, "edges": edges}
 
-    # Create canvas data structure
-    canvas_data = {"nodes": nodes, "edges": edges}
+        # Convert to JSON
+        canvas_json = json.dumps(canvas_data, indent=2)
 
-    # Convert to JSON
-    canvas_json = json.dumps(canvas_data, indent=2)
+        # Try to create the canvas file first (optimistic create)
+        logger.info(f"Creating canvas file: {file_path} in project {project}")
+        try:
+            response = await call_post(
+                client,
+                f"/v2/projects/{active_project.external_id}/resource",
+                json={"file_path": file_path, "content": canvas_json},
+            )
+            action = "Created"
+        except Exception as e:
+            # If creation failed due to conflict (already exists), try to update
+            if (
+                "409" in str(e)
+                or "conflict" in str(e).lower()
+                or "already exists" in str(e).lower()
+            ):
+                logger.info(f"Canvas file exists, updating instead: {file_path}")
+                try:
+                    entity_id = await resolve_entity_id(
+                        client, active_project.external_id, file_path
+                    )
+                    # For update, send content in JSON body
+                    response = await call_put(
+                        client,
+                        f"/v2/projects/{active_project.external_id}/resource/{entity_id}",
+                        json={"content": canvas_json},
+                    )
+                    action = "Updated"
+                except Exception as update_error:  # pragma: no cover
+                    # Re-raise the original error if update also fails
+                    raise e from update_error  # pragma: no cover
+            else:
+                # Re-raise if it's not a conflict error
+                raise  # pragma: no cover
 
-    # Write the file using the resource API
-    logger.info(f"Creating canvas file: {file_path} in project {project}")
-    response = await call_put(client, f"{project_url}/resource/{file_path}", json=canvas_json)
+        # Parse response
+        result = response.json()
+        logger.debug(result)
 
-    # Parse response
-    result = response.json()
-    logger.debug(result)
+        # Build summary
+        summary = [f"# {action}: {file_path}", "\nThe canvas is ready to open in Obsidian."]
 
-    # Build summary
-    action = "Created" if response.status_code == 201 else "Updated"
-    summary = [f"# {action}: {file_path}", "\nThe canvas is ready to open in Obsidian."]
-
-    return "\n".join(summary)
+        return "\n".join(summary)
